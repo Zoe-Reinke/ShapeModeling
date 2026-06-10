@@ -1,0 +1,15 @@
+# Development dependencies (testing, linting, type-checking).
+# Install with:  pip install -r requirements-dev.txt
+-r requirements.txt
+pytest>=7.4
+ruff>=0.4
+mypy>=1.8
+# Notebook + visualization (notebooks/*.ipynb)
+jupyter>=1.0
+matplotlib>=3.7
+# Analysis stage: surface extraction, Procrustes, PCA (mirrors the "analysis" extra in
+# pyproject.toml). ShapeWorks (particle correspondence) is NOT pip-installable -- install
+# it separately via the official ShapeWorks distribution.
+scikit-image>=0.22
+scikit-learn>=1.3
+scipy>=1.11

@@ -216,3 +216,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# Project-specific
+# ---------------------------------------------------------------------------
+
+# Input data (MRI volumes + segmentation masks) — never committed, fetched separately
+/PROMISE12/
+/Prostate158/
+/SAML/
+
+# ShapeWorks run outputs (groomed volumes, particles, projects) — regenerated
+/shapeworks_work*/
+
+# Local Claude Code settings (personal, machine-specific)
+.claude/settings.local.json
+
+# VS Code workspace file (contains machine-specific absolute paths)
+*.code-workspace

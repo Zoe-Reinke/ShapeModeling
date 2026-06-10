@@ -1,0 +1,4 @@
+# Runtime dependencies for shape-modeling.
+# Install with:  pip install -r requirements.txt
+SimpleITK>=2.3
+numpy>=1.24

@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shape-modeling"
+version = "0.1.0"
+description = "Statistical shape modeling of organ anatomy from MRI and segmentation masks."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "SimpleITK>=2.3",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.4",
+    "mypy>=1.8",
+]
+# Surface extraction, Procrustes, and PCA (analysis stage). ShapeWorks (used for
+# particle correspondence) is not pip-installable -- install it separately.
+analysis = [
+    "scikit-image>=0.22",
+    "scikit-learn>=1.3",
+    "scipy>=1.11",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+src = ["src", "tests"]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.10"
+packages = ["shape_modeling"]
+mypy_path = "src"
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+# Third-party analysis libraries ship no type information.
+[[tool.mypy.overrides]]
+module = [
+    "skimage",
+    "skimage.*",
+    "sklearn",
+    "sklearn.*",
+    "scipy",
+    "scipy.*",
+    "shapeworks",
+    "shapeworks.*",
+    "tifffile.*",
+]
+ignore_missing_imports = true
+follow_imports = "skip"
