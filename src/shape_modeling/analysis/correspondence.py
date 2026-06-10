@@ -2,9 +2,10 @@
 
 ShapeWorks places ``M`` corresponding particles on every shape so that particle ``j`` marks
 the same anatomical location on each subject -- the correspondence PCA needs. The flow is:
-groom each whole-gland segmentation (antialias -> isotropic resample -> signed distance
-transform), run the particle optimizer over the groomed shapes, then read the per-subject
-``*_world.particles`` into an ``(S, M, 3)`` array.
+groom each whole-gland segmentation (antialias -> isotropic resample -> centre-of-mass +
+rigid alignment to a reference -> crop -> signed distance transform), run the particle
+optimizer over the groomed shapes, then read the per-subject ``*_world.particles`` into an
+``(S, M, 3)`` array.
 
 **ShapeWorks is not pip-installable.** Install it from the official distribution and run this
 module from its environment (so ``import shapeworks`` works and the ``shapeworks`` CLI is on
@@ -21,7 +22,7 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import SimpleITK as sitk
@@ -49,9 +50,13 @@ class ShapeWorksConfig:
     ending_regularization: float = 10.0
     iso_spacing: float = 1.0  # isotropic resample (mm) during grooming
     antialias_iterations: int = 30
-    pad_voxels: int = 20  # background margin (voxels) added to the 1 mm mask before the DT, so a
-    # gland touching the scan's field-of-view edge still has room for the optimizer to query around
-    blur_sigma: float = 1.0  # Gaussian smoothing (mm) of the DT; gentler gradients for optimizer
+    pad_voxels: int = 20  # background margin (voxels): added before the rigid transform so a
+    # rotated gland is not clipped, and again around each cropped mask so the DT has room on every
+    # face (a gland touching the scan's field-of-view edge still gets queried safely)
+    icp_iterations: int = 200  # iterations for the ICP rigid alignment to the reference shape
+    align_iso_value: float = 0.0  # DT level-set used as the surface for ICP (a DT's surface is 0)
+    blur_sigma: float = 1.3  # Gaussian smoothing (mm) of the DT; gentler gradients + smoother
+    # surfaces (ShapeWorks' recommended default for segmentations)
     # How far (in voxels) from the zero level-set the optimizer trusts the distance transform.
     # Must exceed the deepest interior distance (a prostate half-thickness is ~20 mm, so the DT
     # reaches ~+20 inside): ShapeWorks' default ~4 is too small and samples taken in the interior at
@@ -172,8 +177,13 @@ def _check_particles(
         )
 
 
-def _groom(entry: CohortEntry, config: ShapeWorksConfig, dest: Path, sw: object) -> Path:
-    """Groom one whole-gland segmentation to a signed distance transform; return its path."""
+def _foreground_voxels(img: Any) -> int:
+    """Number of foreground voxels (>0.5) in a binary ShapeWorks ``Image``."""
+    return int(np.count_nonzero(img.toArray() > 0.5))  # type: ignore[attr-defined]
+
+
+def _binary_seg_image(entry: CohortEntry, dest: Path, sw: object) -> Any:
+    """Write the whole-gland mask as a NRRD and load it back as a binary ShapeWorks ``Image``."""
     if entry.organ.array is None:
         raise ValueError(f"case {entry.case_id!r}: organ pixels not loaded")
     mask = (entry.organ.array > 0).astype(np.uint8)
@@ -183,31 +193,104 @@ def _groom(entry: CohortEntry, config: ShapeWorksConfig, dest: Path, sw: object)
         img.CopyInformation(src)
     seg_path = dest / f"{_sanitize(entry.case_id)}.nrrd"
     sitk.WriteImage(img, str(seg_path))
+    return sw.Image(str(seg_path))  # type: ignore[attr-defined]
 
-    # antialias -> resample -> RE-BINARIZE -> PAD -> signed distance transform (ShapeWorks Image).
-    # Three non-obvious steps, each fixing a way the DT goes degenerate (which scatters particles or
-    # aborts the optimizer):
-    #   * antialias makes a smooth signed field, but resampling anisotropic slices to 1 mm with
-    #     linear interpolation SMEARS the 0-crossing into a thick band (~16% of voxels near 0).
-    #     binarize() re-thresholds it back to a crisp 0/1 mask, then computeDT(0.5) takes distance
-    #     to the 0/1 midpoint -- the true surface. (computeDT(0.0) after binarize is degenerate: 0
-    #     is the background value, so "the surface" becomes the whole background -> inf distances.)
-    #   * pad AFTER resample (not before): resample re-grids to the original physical extent and
-    #     discards earlier padding, so padding first leaves the DT flush against the field of view.
-    #     A gland cut off at the FOV edge (e.g. Prostate158 094 touches z-slice 0) then sits on the
-    #     image boundary and the optimizer queries the DT just outside it ("...outside the given
-    #     image domain"). Padding the 1 mm binary with background 0 gives every face a real margin.
-    groomed = sw.Image(str(seg_path))  # type: ignore[attr-defined]
-    groomed.antialias(config.antialias_iterations)
-    groomed.resample([config.iso_spacing] * 3, sw.InterpolationType.Linear)  # type: ignore[attr-defined]
-    groomed.binarize()  # collapse the resample-smeared interface back to a crisp 0/1 mask
-    groomed.pad(config.pad_voxels, 0)  # 0 = background; AFTER resample so the margin survives
-    groomed.computeDT(0.5)  # distance to the 0/1 midpoint (the surface)
-    if config.blur_sigma > 0:
-        groomed.gaussianBlur(config.blur_sigma)  # smooth the DT for gentler optimizer gradients
-    dt_path = dest / f"{_sanitize(entry.case_id)}_DT.nrrd"
-    groomed.write(str(dt_path))
-    return dt_path
+
+def _groom_cohort(
+    cohort: list[CohortEntry], config: ShapeWorksConfig, dest: Path, sw: object
+) -> list[Path]:
+    """Groom the whole cohort to aligned signed distance transforms; return DT paths in order.
+
+    Follows the ShapeWorks recommended segmentation workflow so the groomed shapes are
+    pose-normalised (a prerequisite the optimiser's own Procrustes cannot supply -- that only
+    aligns particles, not the groomed images shown in Studio):
+
+      1. per subject: antialias -> isotropic resample -> RE-BINARIZE -> centre-of-mass align;
+      2. pick a medoid reference and rigidly (ICP) align every shape to it;
+      3. fit each aligned mask to its own bounding box + margin -> signed distance transform.
+
+    Three non-obvious points:
+      * RE-BINARIZE after resample: resampling anisotropic slices to 1 mm with linear interpolation
+        SMEARS the 0-crossing into a thick band; binarize() re-thresholds it to a crisp 0/1 mask so
+        computeDT(0.5) takes distance to the 0/1 midpoint -- the true surface. (computeDT(0.0) after
+        binarize is degenerate: 0 is background, so "the surface" becomes the whole background.)
+      * RESAMPLE THE ALIGNMENT ONTO THE REFERENCE'S GRID, not each subject's own grid: applying a
+        rigid transform in place keeps the subject's original grid, so a rotation/translation that
+        swings the gland past that grid clips it (no fixed pad reliably absorbs every subject's
+        rotation -- case '054' overran a 20-voxel pad). Resampling onto the (padded) reference grid
+        lands every aligned gland inside that frame by construction. See step 2.
+      * fitRegion (not crop) in step 3: a gland cut off at the FOV edge (e.g. Prostate158 094 at
+        z-slice 0) would sit on the boundary where the optimiser queries the DT just outside it;
+        fitRegion pads with background so the DT keeps a margin on every face.
+
+    ICP (``createRigidRegistrationTransform``) requires *distance transforms*, so the per-subject
+    DTs are built first, used to choose + align to the reference, then the transform is applied to
+    the binary mask (the final DT is recomputed after cropping). All subjects' images are held in
+    memory at once (the cohort is ~10^2 cases); the per-image crop in step 3 keeps that bounded.
+    """
+    iso, anti = config.iso_spacing, config.antialias_iterations
+
+    # 1. antialias -> isotropic resample -> re-binarize -> centre-of-mass align (per subject).
+    binaries: list[Any] = []
+    for entry in cohort:
+        img = _binary_seg_image(entry, dest, sw)
+        img.antialias(anti).resample(iso, sw.InterpolationType.Linear).binarize()  # type: ignore[attr-defined]
+        img.antialias(anti)
+        img.translate(img.center() - img.centerOfMass()).binarize()  # COM -> image centre
+        if _foreground_voxels(img) == 0:
+            raise ValueError(
+                f"case {entry.case_id!r}: groomed mask is EMPTY after antialias/resample/COM-align "
+                f"(antialias_iterations={anti}, iso_spacing={iso}). The organ mask is likely so "
+                "small that antialias + resample eroded it away -- check the QC volume for it."
+            )
+        binaries.append(img)
+
+    # 2. reference selection + rigid (ICP) alignment to it. ICP needs DTs; the transform it yields
+    #    is applied to the binary mask, which is re-binarised to stay crisp.
+    #
+    #    The transform is resampled onto a COMMON output grid (the reference's grid, padded), NOT
+    #    the subject's own grid. Applying a transform in place keeps the subject's original grid,
+    #    so any rotation/translation that swings the gland past that grid clips it -- and a pad big
+    #    enough to absorb every subject's rotation is hard to pick (case '054' overran a 20-voxel
+    #    pad). Since every shape is aligned *to* the reference, resampling onto the reference's grid
+    #    lands each gland where the reference gland sits, inside that frame by construction; padding
+    #    the frame by pad_voxels leaves room for glands a little larger than the reference.
+    dts = [b.copy().computeDT(0.5) for b in binaries]
+    ref_idx = sw.find_reference_image_index(dts)  # type: ignore[attr-defined]
+    ref = dts[ref_idx].copy()
+    frame = binaries[ref_idx].copy().pad(config.pad_voxels, 0)  # common output grid for every shape
+    out = (frame.origin(), frame.dims(), frame.spacing(), frame.coordsys())
+    for entry, binary, dt in zip(cohort, binaries, dts, strict=True):
+        transform = dt.createRigidRegistrationTransform(
+            ref, config.align_iso_value, config.icp_iterations
+        )
+        binary.applyTransform(transform, *out, sw.InterpolationType.Linear).binarize()  # type: ignore[attr-defined]
+        if _foreground_voxels(binary) == 0:
+            raise ValueError(
+                f"case {entry.case_id!r}: groomed mask is EMPTY after rigid (ICP) alignment to the "
+                "reference -- the aligned gland fell outside the reference frame (padded by "
+                f"{config.pad_voxels} voxels). This case aligns poorly to the reference; inspect, "
+                "or increase ShapeWorksConfig.pad_voxels if its gland is just larger than the "
+                "reference's."
+            )
+    del dts, ref, frame  # free the pre-alignment DTs / frame before recomputing the final ones
+
+    # 3. crop each aligned mask to its own bounding box + margin -> DT -> smooth -> write.
+    dt_paths: list[Path] = []
+    for entry, binary in zip(cohort, binaries, strict=True):
+        bbox = sw.ImageUtils.boundingBox([binary], 0.5).pad(config.pad_voxels)  # type: ignore[attr-defined]
+        # fitRegion (not crop): when a gland sits within pad_voxels of an image face -- e.g. one
+        # flush against the FOV edge, or pushed there by the rigid transform above -- the padded
+        # bbox spills past the grid and crop() raises "Invalid region ... outside physical bounds".
+        # fitRegion crops where the region is inside the grid and PADS with background (0) where it
+        # is not, so the DT always gets a clean margin on every face. Identical to crop otherwise.
+        binary.fitRegion(bbox).computeDT(0.5)  # distance to the 0/1 midpoint (the surface)
+        if config.blur_sigma > 0:
+            binary.gaussianBlur(config.blur_sigma)  # smoother surfaces + gentler gradients
+        dt_path = dest / f"{_sanitize(entry.case_id)}_DT.nrrd"
+        binary.write(str(dt_path))
+        dt_paths.append(dt_path)
+    return dt_paths
 
 
 def _optimization_parameters(config: ShapeWorksConfig) -> dict[str, str]:
@@ -253,7 +336,7 @@ def run_shapeworks(
 
     groom_dir = work_dir / "groomed"
     groom_dir.mkdir(exist_ok=True)
-    dt_paths = [_groom(entry, config, groom_dir, sw) for entry in cohort]
+    dt_paths = _groom_cohort(cohort, config, groom_dir, sw)
 
     # Build a ShapeWorks project of the groomed shapes and run the optimizer via the CLI.
     project = sw.Project()  # type: ignore[attr-defined]

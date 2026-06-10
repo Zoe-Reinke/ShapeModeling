@@ -12,11 +12,12 @@ Statistical Shape Model (SSM) pipeline for organ anatomy from MRI volumes and se
 3. Extract surface meshes from masks (`src/shape_modeling/analysis/surface.py`) — first pass done
 4. Align / establish correspondence across subjects (`src/shape_modeling/analysis/`) — first pass done
 5. PCA-based SSM construction (`src/shape_modeling/analysis/ssm.py`) — first pass done
-6. Statistical group analysis (healthy vs. cancerous)
+6. Statistical group analysis (healthy vs. cancerous) (`src/shape_modeling/analysis/groups.py`) — first pass done
 7. Model export
 
-Stages 3–5 currently exist as an **exploratory first pass** (see Analysis below): good enough
-to inspect the cohort, not the final model.
+Stages 3–6 currently exist as an **exploratory first pass** (see Analysis below): good enough
+to inspect the cohort and answer "is there a signal?", not the final model. The correspondence
+is throwaway-quality, so any group effect is *suggestive*, not a validated biomarker.
 
 ## Layout & commands
 
@@ -34,10 +35,12 @@ via **SimpleITK** (the only reader that handles both). Two layouts are supported
 - **Per-patient directory** (`Prostate158/`): one folder per case (`020/`, `021/`, …, 139
   cases), each with MRI sequences (`t2`, `adc`, `dwi`) and segmentations named
   `<sequence>_<structure>_reader<N>.nii.gz`.
-- **Flat** (`PROMISE12/`): cases keyed by filename (`CaseXX.mhd` + `CaseXX_segmentation.mhd`).
+- **Flat** (`PROMISE12/`, `SAML/`): cases keyed by filename (`CaseXX.mhd` + `CaseXX_segmentation.mhd`).
   PROMISE12 splits these across sub-folders (`TestData/`, `TrainingDataPart1..3/`) that
   **reuse the same `CaseNN` ids for different patients** — so flat ids are namespaced by
-  sub-folder (see below).
+  sub-folder (see below). `SAML/` is the multi-center prostate set used in place of PROMISE12
+  for the analysis (one sub-folder per acquisition site: `BIDMC/`, `BMC/`, `HK/`, `I2CVB/`,
+  `RUNMC/`, `UCL/`), so each site becomes its own labelled source.
 
 Reader (`src/shape_modeling/io/reader.py`) — `discover_cases(dir)` returns a `Dataset` of
 `Case` objects. A `Case` holds `mris: dict[sequence -> LoadedVolume]`, `organ_segs: list`,
@@ -82,18 +85,27 @@ different config for thyroid/carotid. Reuses `reader.geometry_matches`. SimpleIT
 only. Note: SimpleITK's NIfTI writer drops NaN, so the finite check is unit-tested on an
 in-memory array, not a written fixture.
 
-## Analysis (exploratory SSM, stages 3–5)
+## Analysis (exploratory SSM, stages 3–6)
 
 `src/shape_modeling/analysis/` turns a `Dataset` into a first-pass shape model so the cohort
-can be inspected before the final model. Driver: `notebooks/explore_shapes.ipynb`. This is
-**throwaway-quality** — the correspondence is "good enough to look at", not final.
+can be inspected before the final model. Three notebook drivers, all **throwaway-quality** (the
+correspondence is "good enough to look at", not final):
+- `notebooks/explore_shapes.ipynb` — healthy whole-gland SSM, multi-center (Prostate158 + SAML),
+  with the full site/acquisition/annotation confound tests (sections 6–7).
+- `notebooks/explore_shapes_alldata.ipynb` — pooled **anatomical** basis over *all* glands
+  (healthy + cancer, multi-center) via `build_grouped_cohort`. Descriptive only — **not** a
+  substrate for the cancer question (cancer is confounded with source there; do that test in the
+  Prostate158-only grouped run).
+- `notebooks/explore_cancer_shape.ipynb` — stage-6 headline test, **within Prostate158** only.
 
-- **`cohort.py`** — `build_cohort({source_label: Dataset}) -> list[CohortEntry]`. Keeps
-  **healthy** cases (`is_healthy` = no `cancer_segs`) that have an organ seg; each entry
-  carries `source`, `volume_cm3`, and the chosen organ `LoadedVolume`. Whole gland =
-  `organ_segs[0] > 0` (first reader; binarised for cross-dataset comparability). Discover each
-  dataset separately so the source label is unambiguous. Healthy cohort on current data ≈ 136
-  (80 PROMISE12 + 56 Prostate158; the other 83 Prostate158 cases have tumour segs).
+- **`cohort.py`** — `build_cohort({source_label: Dataset}) -> list[CohortEntry]` keeps **healthy**
+  cases (`is_healthy` = no `cancer_segs`) with an organ seg; `build_grouped_cohort(...)` keeps
+  **every** case with an organ seg and tags each `is_cancer`. Each entry carries `source`,
+  `volume_cm3`, `is_cancer`, and the chosen organ `LoadedVolume`. Whole gland = `organ_segs[0] > 0`
+  (first reader; binarised for cross-dataset comparability). Discover each dataset separately so
+  the source label is unambiguous. Current healthy cohort = 153 (56 Prostate158 + 97 SAML, after
+  excluding the `I2CVB` site whose masks are planar-truncated — see [[exploratory-ssm-findings]]);
+  the all-data basis adds the 83 Prostate158 cancer cases on top.
 - **`surface.py`** — `clean_mask` (largest connected component, fill holes, optional Gaussian
   anti-alias) then `extract_surface` (marching cubes → mesh in **physical mm** via the
   volume's SimpleITK index→physical transform). `save_ply` writes a mesh for viewing.
@@ -115,10 +127,27 @@ can be inspected before the final model. Driver: `notebooks/explore_shapes.ipynb
   works without it. `run_shapeworks(cohort, ShapeWorksConfig) -> ParticleSystem` (caches
   particles in `work_dir/particles.npz`). `load_particles(dir, case_ids)` reads particle files
   from any ShapeWorks run (e.g. Studio) with no package needed. Case ids are sanitised
-  (`/`→`__`) for filenames. **Grooming** (`_groom`): pad(0) → antialias → resample(Linear) →
-  `binarize()` → `computeDT(0.5)`. Order matters — padding *after* antialias coats the DT border
-  in the surface value, and skipping the re-`binarize()` leaves the resample-smeared interface in
-  the DT; either makes the transform degenerate and scatters particles (see [[grooming-dt-bug]]).
+  (`/`→`__`) for filenames. **Grooming** (`_groom_cohort`, the whole cohort together) follows the
+  ShapeWorks recommended segmentation workflow so the groomed DTs are **pose-normalised** (Studio
+  shows them aligned — the optimizer's own `procrustes` only aligns *particles*, not the groomed
+  images): per subject `antialias → resample(Linear, iso) → binarize() → centre-of-mass align`;
+  then pick a medoid reference (`find_reference_image_index`) and rigidly ICP-align every shape to
+  it (`createRigidRegistrationTransform` **requires DTs**, so per-subject DTs are built first, used
+  to choose+align to the reference, then the transform is applied to the binary); then per subject
+  `fitRegion(own bbox + pad) → computeDT(0.5) → gaussianBlur(blur_sigma)`. Three things bite:
+  re-`binarize()` after the Linear resample (it smears the 0-crossing into a band; `computeDT(0.5)`
+  needs a crisp 0/1 mask — see [[grooming-dt-bug]]); apply the rigid transform **resampled onto the
+  reference's grid** (`applyTransform(t, ref.origin/dims/spacing/coordsys, …)`), **not in place** —
+  an in-place transform keeps the subject's own grid, so a rotation/translation that swings the
+  gland past it clips the gland away (case `054` came out *empty*; no fixed pad reliably absorbs
+  every subject's rotation, esp. grids whose origin sits far from `(0,0,0)`). Resampling onto the
+  (pad-grown) reference grid lands every aligned gland inside that frame by construction. `_groom_cohort`
+  also raises a **named** error if any subject's mask is empty after step 1 (eroded by antialias) or
+  step 2 (fell outside the frame). And use `fitRegion`, **not `crop`**, around the step-3 bbox: when
+  a gland sits within `pad` of a face, the padded bbox spills past the grid and `crop` raises
+  `ValueError: Invalid region … outside physical bounds`; `fitRegion` pads with background instead, so
+  the DT keeps a margin on every face. The `*_local.particles` now sit in the **aligned+cropped** DT
+  frame, so `warp_surface` pairing (subject groomed-DT surface ↔ its local particles) stays self-consistent.
   Both fresh and cached particles are gated by `particle_spread_ratio` (median over subjects of
   particle-extent / organ-extent; healthy ≈ 1.0–1.3, degenerate ≈ 3+); `run_shapeworks` raises if
   it exceeds `ShapeWorksConfig.max_spread_ratio` (default 1.75; `None` disables), so a stale or
@@ -131,6 +160,13 @@ can be inspected before the final model. Driver: `notebooks/explore_shapes.ipynb
   coordinates are unitless (~0.0x, not mm)** and aligned centroid size is ~constant — to test
   whether a mode is a *size* mode, correlate its score against centroid size of the **raw**
   (pre-`gpa`) particles, not the aligned ones. numpy + scipy + scikit-learn.
+- **`groups.py`** (stage 6, healthy vs. cancer) — `compare_groups(model, cohort)` bundles:
+  `per_mode_tests` (per-mode Mann-Whitney + Cohen's d, BH/FDR-corrected), `shape_predicts_cancer`
+  (omnibus "does shape predict cancer?" — CV logistic AUC + label-permutation p over the top
+  modes), `group_mean_difference_shape` (per-point mm displacement between the two group-mean
+  glands), and `volume_difference` (raw size gap). Driver: `explore_cancer_shape.ipynb`, run
+  **within Prostate158** with GPA `scale=False` (keeps size; volume gap reported separately).
+  See [[stage6-cancer-shape-analysis.md]] for the current result.
 
 Synthetic tests in `tests/test_analysis.py` (no ShapeWorks needed); the ShapeWorks optimiser
 itself is an opt-in smoke test (`pytest.importorskip("shapeworks")`).
