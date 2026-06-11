@@ -25,6 +25,8 @@ analysis = [
     "scikit-image>=0.22",
     "scikit-learn>=1.3",
     "scipy>=1.11",
+    "neuroCombat>=0.2.12",  # ComBat site harmonization (analysis.harmonize)
+    "pandas>=2.0",          # neuroCombat needs it but doesn't declare the dependency
 ]
 
 [tool.setuptools.packages.find]
@@ -47,6 +49,10 @@ disallow_untyped_defs = true
 # Third-party analysis libraries ship no type information.
 [[tool.mypy.overrides]]
 module = [
+    "neuroCombat",
+    "neuroCombat.*",
+    "pandas",
+    "pandas.*",
     "skimage",
     "skimage.*",
     "sklearn",

@@ -11,6 +11,7 @@ Statistical Shape Model (SSM) pipeline for organ anatomy from MRI volumes and se
 2. Quality control of volumes + masks (`src/shape_modeling/qc.py`) — done
 3. Extract surface meshes from masks (`src/shape_modeling/analysis/surface.py`) — first pass done
 4. Align / establish correspondence across subjects (`src/shape_modeling/analysis/`) — first pass done
+   (multi-center cohorts also **ComBat-harmonized on site** between GPA and PCA, `analysis/harmonize.py`)
 5. PCA-based SSM construction (`src/shape_modeling/analysis/ssm.py`) — first pass done
 6. Statistical group analysis (healthy vs. cancerous) (`src/shape_modeling/analysis/groups.py`) — first pass done
 7. Model export
@@ -91,10 +92,13 @@ in-memory array, not a written fixture.
 can be inspected before the final model. Three notebook drivers, all **throwaway-quality** (the
 correspondence is "good enough to look at", not final):
 - `notebooks/explore_shapes.ipynb` — healthy whole-gland SSM, multi-center (Prostate158 + SAML),
-  with the full site/acquisition/annotation confound tests (sections 6–7).
+  with the full site/acquisition/annotation confound tests (section 6). The canonical `model` is
+  **ComBat-harmonized on centre** (built in section 4); the un-harmonized fit is kept as `model_raw`
+  for the section-6 before/after evidence (see [[exploratory-ssm-findings]]).
 - `notebooks/explore_shapes_alldata.ipynb` — pooled **anatomical** basis over *all* glands
-  (healthy + cancer, multi-center) via `build_grouped_cohort`. Descriptive only — **not** a
-  substrate for the cancer question (cancer is confounded with source there; do that test in the
+  (healthy + cancer, multi-center) via `build_grouped_cohort`, also ComBat-harmonized on centre
+  (cancer is within the Prostate158 batch, so the contrast is preserved). Descriptive only — **not**
+  a substrate for the cancer question (cancer is confounded with source there; do that test in the
   Prostate158-only grouped run).
 - `notebooks/explore_cancer_shape.ipynb` — stage-6 headline test, **within Prostate158** only.
 
@@ -160,6 +164,18 @@ correspondence is "good enough to look at", not final):
   coordinates are unitless (~0.0x, not mm)** and aligned centroid size is ~constant — to test
   whether a mode is a *size* mode, correlate its score against centroid size of the **raw**
   (pre-`gpa`) particles, not the aligned ones. numpy + scipy + scikit-learn.
+- **`harmonize.py`** — `combat_harmonize(particles, batch, continuous=None, …)` removes acquisition
+  **site** effects from corresponded particle coordinates with ComBat (empirical-Bayes location/scale),
+  so a multi-center basis encodes anatomy not scanner. Inserts **between GPA and PCA**: harmonize the
+  `(S, M, 3)` GPA-aligned coords against `batch` (centre), protecting raw centroid size as a
+  `continuous` covariate so real size variation survives, then re-`gpa` + `build_ssm`. ComBat needs
+  *corresponded* points (it corrects feature-by-feature), so it runs **after** ShapeWorks, never before.
+  Uses **neuroCombat** (its API is features×samples — the helper transposes; size goes in
+  `continuous_cols`, not as a batch). neuroCombat is optional (in the `.[analysis]` extra, with
+  `pandas`) and the import is **deferred to call time** like ShapeWorks. Verify on the re-fit scores:
+  Kruskal site p should drop out of significance while mode-1 `r(raw centroid size)` survives (~0.36);
+  if size collapses, it got entangled with site. Smallest sites have n=12, so the EB scale terms stay
+  noisy even after shrinkage — expected.
 - **`groups.py`** (stage 6, healthy vs. cancer) — `compare_groups(model, cohort)` bundles:
   `per_mode_tests` (per-mode Mann-Whitney + Cohen's d, BH/FDR-corrected), `shape_predicts_cancer`
   (omnibus "does shape predict cancer?" — CV logistic AUC + label-permutation p over the top

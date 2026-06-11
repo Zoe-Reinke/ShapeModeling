@@ -34,6 +34,7 @@ from shape_modeling.analysis.groups import (
     shape_predicts_cancer,
     volume_difference,
 )
+from shape_modeling.analysis.harmonize import combat_harmonize
 from shape_modeling.analysis.ssm import (
     ShapeModel,
     build_ssm,
@@ -66,6 +67,7 @@ __all__ = [
     "build_ssm",
     "centroid_size",
     "clean_mask",
+    "combat_harmonize",
     "compare_groups",
     "export_mode_shapes",
     "extract_surface",

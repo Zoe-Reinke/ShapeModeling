@@ -19,6 +19,7 @@ from shape_modeling.analysis import (
     build_ssm,
     centroid_size,
     clean_mask,
+    combat_harmonize,
     export_mode_shapes,
     extract_surface,
     gpa,
@@ -311,6 +312,64 @@ def test_export_mode_shapes_writes_ply_per_step(tmp_path: Path) -> None:
     n_faces = len(hull_surface(model.mean).faces)
     for p in paths:
         assert f"element face {n_faces}" in p.read_text()
+
+
+# --------------------------------------------------------------------------- #
+# ComBat harmonization
+# --------------------------------------------------------------------------- #
+
+
+def test_combat_harmonize_validates_shapes() -> None:
+    # These guards run before the deferred neuroCombat import, so no install needed.
+    with pytest.raises(ValueError, match=r"\(S, M, 3\)"):
+        combat_harmonize(np.zeros((4, 5, 2)), np.array(["a", "b", "a", "b"]))
+    with pytest.raises(ValueError, match="batch must be"):
+        combat_harmonize(np.zeros((4, 5, 3)), np.array(["a", "b", "a"]))
+    with pytest.raises(ValueError, match="2 batch levels"):
+        combat_harmonize(np.zeros((4, 5, 3)), np.array(["a", "a", "a", "a"]))
+
+
+def test_combat_harmonize_removes_site_keeps_size() -> None:
+    neurocombat = pytest.importorskip("neuroCombat", reason="neuroCombat not installed")
+    assert neurocombat  # silence unused-import linters; the import itself is the gate
+    rng = np.random.default_rng(17)
+    n_points = 40
+    base = rng.normal(size=(n_points, 3))
+    direction = rng.normal(size=(n_points, 3))  # a genuine "size"/biology axis
+
+    coords, batch, sizes = [], [], []
+    # Two sites, each with an additive coordinate shift that ComBat should remove. Real size
+    # variation (along `direction`) is shared across sites and must survive.
+    for site, shift in (("siteA", -1.5), ("siteB", +1.5)):
+        for _ in range(20):
+            size = rng.normal()
+            shape = base + size * direction + shift + rng.normal(scale=0.05, size=(n_points, 3))
+            coords.append(shape)
+            batch.append(site)
+            sizes.append(size)
+    coords = np.stack(coords)
+    batch = np.array(batch)
+    sizes = np.array(sizes)
+
+    harmonized = combat_harmonize(coords, batch, sizes, covariate_names=["size"])
+    assert harmonized.shape == coords.shape
+
+    # Per-site mean separation (the batch effect) shrinks dramatically.
+    def site_gap(arr: np.ndarray) -> float:
+        a = arr[batch == "siteA"].mean(axis=0)
+        b = arr[batch == "siteB"].mean(axis=0)
+        return float(np.linalg.norm(a - b))
+
+    assert site_gap(harmonized) < 0.25 * site_gap(coords)
+
+    # The biological size axis is preserved: projection onto `direction` still tracks the
+    # generating size parameter about as well as before harmonization.
+    unit = (direction / np.linalg.norm(direction)).ravel()
+    proj_before = coords.reshape(len(coords), -1) @ unit
+    proj_after = harmonized.reshape(len(harmonized), -1) @ unit
+    r_before = abs(np.corrcoef(proj_before, sizes)[0, 1])
+    r_after = abs(np.corrcoef(proj_after, sizes)[0, 1])
+    assert r_after > 0.9 * r_before
 
 
 # --------------------------------------------------------------------------- #
