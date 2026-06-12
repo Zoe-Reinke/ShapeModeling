@@ -26,6 +26,7 @@ from shape_modeling.analysis import (
     hull_surface,
     mode_shape,
     save_ply,
+    smooth_surface,
     warp_surface,
 )
 from shape_modeling.analysis.cohort import CohortEntry
@@ -288,6 +289,41 @@ def test_warp_surface_keeps_faces_and_lands_on_target() -> None:
     # ...and the warp interpolates: evaluating it at the source particles returns the targets.
     control = warp_surface(Surface(verts=src, faces=np.empty((0, 3), int)), src, dst)
     np.testing.assert_allclose(control.verts, dst, atol=1e-8)
+
+
+def _mean_edge_roughness(verts: np.ndarray, faces: np.ndarray) -> float:
+    """Mean distance of each vertex from the average of its edge-neighbours (bump size)."""
+    n = len(verts)
+    i = np.concatenate([faces[:, 0], faces[:, 1], faces[:, 2]])
+    j = np.concatenate([faces[:, 1], faces[:, 2], faces[:, 0]])
+    nbr_sum = np.zeros((n, 3))
+    np.add.at(nbr_sum, i, verts[j])
+    np.add.at(nbr_sum, j, verts[i])
+    deg = np.bincount(np.concatenate([i, j]), minlength=n).clip(min=1)
+    return float(np.linalg.norm(verts - nbr_sum / deg[:, None], axis=1).mean())
+
+
+def test_smooth_surface_reduces_roughness_keeps_faces_and_shape() -> None:
+    # A smooth sphere (convex hull of points on a sphere), then roughened with radial noise.
+    rng = np.random.default_rng(3)
+    dirs = rng.normal(size=(400, 3))
+    dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
+    faces = hull_surface(dirs).faces
+    noisy = dirs * (1.0 + rng.normal(scale=0.05, size=(len(dirs), 1)))  # radial bumps
+
+    smoothed = smooth_surface(Surface(verts=noisy, faces=faces))
+
+    # faces are untouched, vertex count preserved
+    assert np.array_equal(smoothed.faces, faces)
+    assert smoothed.verts.shape == noisy.shape
+    # high-frequency roughness drops sharply...
+    before = _mean_edge_roughness(noisy, faces)
+    after = _mean_edge_roughness(smoothed.verts, faces)
+    assert after < before / 2
+    # ...while the gross shape (overall radius) is preserved (Taubin does not shrink like Laplacian)
+    r_before = np.linalg.norm(noisy - noisy.mean(0), axis=1).mean()
+    r_after = np.linalg.norm(smoothed.verts - smoothed.verts.mean(0), axis=1).mean()
+    assert abs(r_after - r_before) / r_before < 0.1
 
 
 def test_warp_surface_rejects_mismatched_point_sets() -> None:

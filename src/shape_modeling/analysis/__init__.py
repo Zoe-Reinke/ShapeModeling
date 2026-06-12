@@ -50,6 +50,7 @@ from shape_modeling.analysis.surface import (
     extract_surface,
     hull_surface,
     save_ply,
+    smooth_surface,
     warp_surface,
 )
 
@@ -80,6 +81,7 @@ __all__ = [
     "per_mode_tests",
     "save_ply",
     "shape_predicts_cancer",
+    "smooth_surface",
     "volume_difference",
     "warp_surface",
     "whole_gland_mask",

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from scipy import ndimage
+from scipy import ndimage, sparse
 from scipy.interpolate import RBFInterpolator
 from scipy.spatial import ConvexHull
 from skimage import measure
@@ -32,6 +32,7 @@ __all__ = [
     "extract_surface",
     "hull_surface",
     "save_ply",
+    "smooth_surface",
     "warp_surface",
 ]
 
@@ -193,6 +194,49 @@ def warp_surface(
     # 2. thin-plate spline on the residual only (src_aligned is already close to dst).
     warp = RBFInterpolator(src_aligned, dst, kernel=kernel, smoothing=smoothing)
     return Surface(verts=warp(verts_aligned), faces=np.asarray(template.faces))
+
+
+def smooth_surface(
+    surface: Surface,
+    *,
+    iterations: int = 15,
+    lam: float = 0.5,
+    mu: float = -0.53,
+) -> Surface:
+    """Taubin (λ|μ) smoothing of a triangle mesh; faces unchanged, gross shape preserved.
+
+    Removes high-frequency vertex noise -- marching-cubes staircase faceting, or the surface
+    texture a single real gland injects when its mesh is warped onto an *average* shape (see
+    :func:`warp_surface`). Plain Laplacian smoothing would also shrink the mesh toward its
+    centroid; Taubin alternates a positive Laplacian step (``lam``, smooth + shrink) with a
+    negative one (``mu`` slightly larger in magnitude, smooth + re-inflate) so volume is largely
+    retained over the ``iterations`` passes.
+
+    Uses a uniform-weight graph Laplacian built from the triangle edges (no geometry weighting),
+    which is enough to strip sub-voxel bumps from an organ surface. Returns a new :class:`Surface`.
+    """
+    verts = np.asarray(surface.verts, dtype=np.float64)
+    faces = np.asarray(surface.faces)
+    if verts.ndim != 2 or verts.shape[1] != 3:
+        raise ValueError(f"expected (N, 3) verts, got {verts.shape}")
+    n = len(verts)
+
+    # Undirected vertex adjacency from triangle edges (each edge added both ways, then de-duped).
+    i = np.concatenate([faces[:, 0], faces[:, 1], faces[:, 2]])
+    j = np.concatenate([faces[:, 1], faces[:, 2], faces[:, 0]])
+    rows = np.concatenate([i, j])
+    cols = np.concatenate([j, i])
+    adj = sparse.coo_matrix((np.ones(rows.size), (rows, cols)), shape=(n, n)).tocsr()
+    adj.data[:] = 1.0  # collapse duplicate edges to weight 1
+
+    deg = np.asarray(adj.sum(axis=1)).ravel()
+    # Uniform-weight Laplacian L = D^-1 A - I (each row averages neighbours and subtracts self).
+    lap = sparse.diags(1.0 / np.maximum(deg, 1.0)) @ adj - sparse.eye(n)
+
+    x = verts.copy()
+    for k in range(iterations):
+        x = x + (lam if k % 2 == 0 else mu) * (lap @ x)
+    return Surface(verts=x, faces=surface.faces)
 
 
 def export_mode_shapes(
