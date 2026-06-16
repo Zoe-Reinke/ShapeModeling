@@ -1,7 +1,8 @@
 """Discover, classify, and load MRI volumes and segmentation masks.
 
-The reader scans a directory of medical image files (MetaImage ``.mhd`` or NIfTI
-``.nii``/``.nii.gz``), groups them into per-subject :class:`Case` objects, and works out
+The reader scans a directory of medical image files (MetaImage ``.mhd``, NIfTI
+``.nii``/``.nii.gz``, or NRRD ``.nrrd``/``.nhdr``), groups them into per-subject
+:class:`Case` objects, and works out
 for each file whether it is an MRI volume, an organ ("anatomy") segmentation, or a
 cancer ("tumor") segmentation.
 
@@ -54,7 +55,9 @@ __all__ = [
 
 #: File extensions SimpleITK can read as a single volume. ``.raw``/``.zraw`` are the
 #: payloads of an ``.mhd`` header and are pulled in implicitly, so they are not globbed.
-SUPPORTED_EXTENSIONS: tuple[str, ...] = (".mhd", ".nii", ".nii.gz")
+#: ``.nrrd``/``.nhdr`` (NRRD, detached or attached header) are common segmentation-export
+#: formats (3D Slicer, NCI-ISBI) -- SimpleITK reads them like any other volume.
+SUPPORTED_EXTENSIONS: tuple[str, ...] = (".mhd", ".nii", ".nii.gz", ".nrrd", ".nhdr")
 
 
 class VolumeType(str, Enum):

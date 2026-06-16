@@ -15,18 +15,27 @@ import SimpleITK as sitk
 
 from shape_modeling.analysis import (
     CleanConfig,
+    ExportedModel,
     ShapeModel,
     build_ssm,
     centroid_size,
     clean_mask,
     combat_harmonize,
+    compactness,
+    evaluate_ssm,
     export_mode_shapes,
+    export_model,
     extract_surface,
+    generalization,
     gpa,
     hull_surface,
+    load_model,
+    load_shapeworks_evaluation,
     mode_shape,
     save_ply,
     smooth_surface,
+    specificity,
+    surface_distance,
     warp_surface,
 )
 from shape_modeling.analysis.cohort import CohortEntry
@@ -37,6 +46,7 @@ from shape_modeling.analysis.correspondence import (
     load_particles,
     particle_spread_ratio,
 )
+from shape_modeling.analysis.evaluation import SSMEvaluation, default_mode_grid
 from shape_modeling.analysis.surface import Surface
 from shape_modeling.io.reader import LoadedVolume, VolumeType
 
@@ -496,3 +506,313 @@ def test_run_shapeworks_smoke(tmp_path: Path) -> None:
     assert system.case_ids == ["s0", "s1", "s2"]
     assert system.particles.shape[0] == 3
     assert system.particles.shape[2] == 3
+
+
+# --------------------------------------------------------------------------- #
+# Model export (stage 7)
+# --------------------------------------------------------------------------- #
+
+
+def _single_mode_model() -> ShapeModel:
+    """A small SSM dominated by one mode (reuses the single-mode fixture pattern)."""
+    rng = np.random.default_rng(7)
+    base = rng.normal(size=(12, 3))
+    delta = rng.normal(size=(12, 3))
+    shapes = np.stack([base + a * delta for a in np.linspace(-2.0, 2.0, 9)])
+    return build_ssm(shapes)
+
+
+def _two_mode_model() -> ShapeModel:
+    """An SSM with two well-separated, non-degenerate modes (for pose + multi-mode fits)."""
+    rng = np.random.default_rng(8)
+    base = rng.normal(size=(12, 3))
+    d0 = rng.normal(size=(12, 3))
+    d1 = rng.normal(size=(12, 3))
+    a0 = rng.normal(size=20)
+    a1 = 0.5 * rng.normal(size=20)  # second mode genuinely present, smaller variance
+    shapes = np.stack([base + a0[i] * d0 + a1[i] * d1 for i in range(20)])
+    return build_ssm(shapes)
+
+
+def _fibonacci_sphere(n: int) -> np.ndarray:
+    """``n`` roughly-even points on the unit sphere (a dense, surface-like point set)."""
+    i = np.arange(n)
+    phi = np.arccos(1.0 - 2.0 * (i + 0.5) / n)
+    theta = np.pi * (1.0 + 5.0**0.5) * i
+    return np.stack(
+        [np.cos(theta) * np.sin(phi), np.sin(theta) * np.sin(phi), np.cos(phi)], axis=1
+    )
+
+
+def _ellipsoid_model() -> ShapeModel:
+    """A surface SSM: a unit sphere whose two leading modes stretch the x and y axes.
+
+    Unlike the abstract point-cloud fixtures, the points lie on a real surface, so nearest-point
+    matching (ICP, used by ``fit_surface``) is well-posed -- this mirrors a real organ particle set.
+    """
+    sphere = _fibonacci_sphere(200)
+    rng = np.random.default_rng(11)
+    a, b = rng.normal(size=30), rng.normal(size=30)
+    shapes = np.stack(
+        [sphere * np.array([1.0 + 0.3 * a[i], 1.0 + 0.2 * b[i], 1.0]) for i in range(30)]
+    )
+    return build_ssm(shapes)
+
+
+def load_model_from(model: ShapeModel) -> ExportedModel:
+    """Wrap a ShapeModel as an ExportedModel in-memory (no disk round-trip)."""
+    return ExportedModel(
+        mean=model.mean,
+        components=model.components,
+        eigenvalues=model.eigenvalues,
+        explained_variance_ratio=model.explained_variance_ratio,
+    )
+
+
+def test_export_model_roundtrip_and_metadata(tmp_path: Path) -> None:
+    model = _single_mode_model()
+    faces = hull_surface(model.mean).faces
+    path = export_model(
+        model, tmp_path / "ssm", faces=faces, metadata={"cohort": "synthetic", "scale": True}
+    )
+    assert path.suffix == ".npz"
+
+    loaded = load_model(path)
+    assert loaded.n_points == model.n_points
+    assert loaded.n_modes == model.n_modes
+    np.testing.assert_allclose(loaded.mean, model.mean)
+    np.testing.assert_allclose(loaded.components, model.components)
+    np.testing.assert_allclose(loaded.eigenvalues, model.eigenvalues)
+    np.testing.assert_array_equal(loaded.faces, faces)
+    assert loaded.metadata["cohort"] == "synthetic"
+    assert loaded.metadata["units"] == "normalized"
+
+
+def test_export_model_without_faces(tmp_path: Path) -> None:
+    model = _single_mode_model()
+    loaded = load_model(export_model(model, tmp_path / "ssm"))
+    assert loaded.faces is None
+    with pytest.raises(ValueError, match="no faces"):
+        loaded.surface(np.zeros(loaded.n_modes))
+
+
+def test_instance_mean_and_mode_walk() -> None:
+    model = _single_mode_model()
+    loaded = load_model_from(model)
+
+    # weights=None and all-zero weights both return the mean.
+    np.testing.assert_allclose(loaded.instance(), model.mean)
+    np.testing.assert_allclose(loaded.instance(np.zeros(loaded.n_modes)), model.mean)
+
+    # +/- along mode 0 are symmetric about the mean; matches mode_shape().
+    plus = loaded.instance([2.0])
+    np.testing.assert_allclose(plus, mode_shape(model, 0, 2.0))
+    minus = loaded.instance([-2.0])
+    np.testing.assert_allclose(plus + minus, 2 * model.mean, atol=1e-9)
+
+    with pytest.raises(ValueError, match="only"):
+        loaded.instance(np.zeros(loaded.n_modes + 1))
+
+
+def test_instance_applies_pose() -> None:
+    model = _single_mode_model()
+    loaded = load_model_from(model)
+    rot = _rotation((0.3, -0.2, 0.5))
+    posed = loaded.instance([1.0], pose=(2.0, rot, np.array([10.0, -5.0, 3.0])))
+    expected = 2.0 * (loaded.instance([1.0]) @ rot.T) + np.array([10.0, -5.0, 3.0])
+    np.testing.assert_allclose(posed, expected)
+
+
+def test_fit_recovers_weights_in_model_frame() -> None:
+    model = _single_mode_model()
+    loaded = load_model_from(model)
+    target = loaded.instance([1.5])  # a known shape, already in the model frame
+
+    result = loaded.fit(target, pose=False)
+
+    assert result.weights[0] == pytest.approx(1.5, abs=1e-6)
+    assert result.rmse < 1e-9
+    np.testing.assert_allclose(result.points, target, atol=1e-9)
+
+
+def test_fit_recovers_pose_and_shape() -> None:
+    model = _two_mode_model()
+    loaded = load_model_from(model)
+    rot = _rotation((0.2, 0.4, -0.3))
+    pose = (1.7, rot, np.array([4.0, 8.0, -2.0]))
+    target = loaded.instance([1.0, -0.5], pose=pose)
+
+    result = loaded.fit(target, n_modes=2, n_iter=30)
+
+    assert result.scale == pytest.approx(1.7, rel=1e-2)
+    assert result.weights[0] == pytest.approx(1.0, abs=1e-2)
+    assert result.weights[1] == pytest.approx(-0.5, abs=1e-2)
+    assert result.rmse < 1e-4
+    np.testing.assert_allclose(result.points, target, atol=1e-3)
+
+
+def test_fit_clamps_to_plausible_box() -> None:
+    model = _single_mode_model()
+    loaded = load_model_from(model)
+    target = loaded.instance([5.0])  # implausibly far along mode 0
+
+    result = loaded.fit(target, pose=False, max_sd=3.0)
+    assert result.weights[0] == pytest.approx(3.0, abs=1e-6)
+
+
+def test_fit_rejects_uncorresponded_target() -> None:
+    model = _single_mode_model()
+    loaded = load_model_from(model)
+    with pytest.raises(ValueError, match="correspondence"):
+        loaded.fit(np.zeros((loaded.n_points + 1, 3)))
+
+
+def test_surface_distance_zero_for_identical_and_positive_otherwise() -> None:
+    rng = np.random.default_rng(0)
+    cloud = rng.normal(size=(50, 3))
+    mean, rms, hd95 = surface_distance(cloud, cloud)
+    assert mean == pytest.approx(0.0)
+    assert rms == pytest.approx(0.0)
+    assert hd95 == pytest.approx(0.0)
+
+    # A pure 1 mm shift puts every nearest-neighbour distance at ~1 (clouds are dense enough).
+    shifted_mean, shifted_rms, _ = surface_distance(cloud, cloud + np.array([1.0, 0.0, 0.0]))
+    assert shifted_mean > 0
+    assert shifted_rms >= shifted_mean  # RMS >= mean always
+
+
+def test_fit_surface_recovers_shape_from_uncorresponded_cloud() -> None:
+    loaded = load_model_from(_ellipsoid_model())
+    rot = _rotation((0.2, -0.3, 0.4))
+    pose = (1.5, rot, np.array([5.0, -2.0, 7.0]))
+    truth = loaded.instance([1.5, -1.0], pose=pose)  # an anisotropic, posed held-out ellipsoid
+
+    # Break correspondence: shuffle the rows and append duplicates so N != M and ordering is gone.
+    rng = np.random.default_rng(3)
+    shuffled = truth[rng.permutation(len(truth))]
+    target = np.vstack([shuffled, shuffled[:20]])  # every point still lies on the true surface
+
+    result = loaded.fit_surface(target, n_modes=2, n_iter=100)
+
+    assert result.mean_distance < 0.05  # near-perfect reconstruction (sphere radius ~1)
+    assert result.scale == pytest.approx(1.5, rel=0.05)
+    assert result.weights[0] == pytest.approx(1.5, abs=0.1)
+    assert result.weights[1] == pytest.approx(-1.0, abs=0.1)
+    assert result.points.shape == loaded.mean.shape
+
+
+def test_fit_surface_accepts_surface_and_honours_init_pose() -> None:
+    loaded = load_model_from(_ellipsoid_model())
+    truth = loaded.instance([1.5, -1.0])  # anisotropic, already in the model frame
+    surf = hull_surface(truth)  # a Surface input (verts on the true shape)
+
+    # An identity init_pose skips the multi-restart search; the model frame already matches.
+    result = loaded.fit_surface(surf, n_modes=2, init_pose=(1.0, np.eye(3), np.zeros(3)))
+    assert result.mean_distance < 0.05
+    assert result.weights[0] == pytest.approx(1.5, abs=0.1)
+    assert result.weights[1] == pytest.approx(-1.0, abs=0.1)
+
+
+# --------------------------------------------------------------------------- #
+# SSM quality metrics (compactness / generalization / specificity)
+# --------------------------------------------------------------------------- #
+
+
+def _two_mode_population(rng: np.random.Generator, n: int = 30, m: int = 20) -> np.ndarray:
+    """A population with exactly two dominant, ordered modes plus tiny noise (in mm)."""
+    base = rng.normal(size=(m, 3)) * 10.0
+    mode_a = rng.normal(size=(m, 3))
+    mode_b = rng.normal(size=(m, 3))
+    a = rng.normal(scale=4.0, size=n)  # dominant
+    b = rng.normal(scale=1.0, size=n)  # secondary
+    shapes = base[None] + a[:, None, None] * mode_a[None] + b[:, None, None] * mode_b[None]
+    return shapes + rng.normal(scale=0.01, size=shapes.shape)
+
+
+def test_compactness_matches_pca_variance_ratio_and_is_monotone() -> None:
+    rng = np.random.default_rng(0)
+    shapes = _two_mode_population(rng)
+    cum = compactness(shapes)
+    # equals the cumulative explained-variance ratio of a PCA on the same shapes
+    flat = shapes.reshape(shapes.shape[0], -1)
+    pca_cum = np.cumsum(
+        np.linalg.svd(flat - flat.mean(0), compute_uv=False) ** 2
+    )
+    pca_cum = pca_cum / pca_cum[-1]
+    np.testing.assert_allclose(cum, pca_cum[: len(cum)], atol=1e-9)
+    assert np.all(np.diff(cum) >= -1e-12)  # non-decreasing
+    assert cum[-1] == pytest.approx(1.0, abs=1e-9)
+    # two dominant modes -> first two capture the bulk of the variance
+    assert cum[1] > 0.95
+
+
+def test_compactness_is_scale_invariant() -> None:
+    rng = np.random.default_rng(1)
+    shapes = _two_mode_population(rng)
+    np.testing.assert_allclose(compactness(shapes), compactness(shapes * 7.3), atol=1e-9)
+
+
+def test_generalization_decreases_and_is_in_mm() -> None:
+    rng = np.random.default_rng(2)
+    shapes = _two_mode_population(rng)  # ~10 mm scale
+    gen = generalization(shapes)
+    assert gen[0] > gen[2] > gen[-1]  # adding modes reduces LOO error
+    assert gen[-1] < 0.5  # two-mode data is nearly perfectly reconstructed
+    assert 0.1 < gen[0] < 100.0  # millimetre-scale, not unitless
+
+
+def test_specificity_is_reproducible_and_rises_with_modes() -> None:
+    rng = np.random.default_rng(3)
+    shapes = _two_mode_population(rng)
+    modes = np.array([1, 2, 5, 10])
+    spec_a = specificity(shapes, modes, n_samples=200, seed=42)
+    spec_b = specificity(shapes, modes, n_samples=200, seed=42)
+    np.testing.assert_array_equal(spec_a, spec_b)  # seeded -> deterministic
+    assert spec_a[-1] > spec_a[0]  # extra modes let samples drift off the data
+    assert np.all(spec_a > 0)
+
+
+def test_evaluate_ssm_bundles_aligned_curves() -> None:
+    rng = np.random.default_rng(4)
+    shapes = _two_mode_population(rng, n=25, m=15)
+    ev = evaluate_ssm(shapes, n_specificity_samples=100, seed=0, label="synthetic")
+    assert isinstance(ev, SSMEvaluation)
+    assert ev.n_subjects == 25 and ev.n_points == 15
+    assert len(ev.modes) == len(ev.compactness) == len(ev.generalization) == len(ev.specificity)
+    assert ev.label == "synthetic"
+    assert ev.modes_for_variance(0.90) <= ev.modes_for_variance(0.99)
+    frame = ev.to_frame()
+    assert list(frame.columns) == ["modes", "compactness", "generalization_mm", "specificity_mm"]
+
+
+def test_default_mode_grid_thins_for_large_models() -> None:
+    assert np.array_equal(default_mode_grid(8), np.arange(1, 9))
+    big = default_mode_grid(234)
+    assert big[0] == 1 and big[-1] == 234
+    assert len(big) < 60  # thinned, not every mode
+    assert np.all(np.diff(big) > 0)  # strictly ascending, unique
+
+
+def test_generalization_needs_enough_subjects() -> None:
+    with pytest.raises(ValueError, match="at least 3 subjects"):
+        generalization(np.zeros((2, 5, 3)))
+
+
+def test_evaluation_rejects_bad_shape() -> None:
+    with pytest.raises(ValueError, match=r"\(S, M, 3\)"):
+        compactness(np.zeros((4, 5)))
+
+
+def test_load_shapeworks_evaluation_reads_studio_csvs(tmp_path: Path) -> None:
+    (tmp_path / "compactness.csv").write_text(
+        "#  Number of Modes, Explained Variance\n1, 0.6\n2, 0.85\n3, 0.95\n"
+    )
+    (tmp_path / "generalization.csv").write_text(
+        "#  Number of Modes, Generalization\n1, 2.5\n2, 1.8\n3, 1.4\n"
+    )
+    # specificity.csv intentionally absent -> NaN column
+    ev = load_shapeworks_evaluation(tmp_path)
+    np.testing.assert_array_equal(ev.modes, [1, 2, 3])
+    np.testing.assert_allclose(ev.compactness, [0.6, 0.85, 0.95])
+    np.testing.assert_allclose(ev.generalization, [2.5, 1.8, 1.4])
+    assert np.all(np.isnan(ev.specificity))

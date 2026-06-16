@@ -179,7 +179,7 @@ def _check_particles(
 
 def _foreground_voxels(img: Any) -> int:
     """Number of foreground voxels (>0.5) in a binary ShapeWorks ``Image``."""
-    return int(np.count_nonzero(img.toArray() > 0.5))  # type: ignore[attr-defined]
+    return int(np.count_nonzero(img.toArray() > 0.5))
 
 
 def _binary_seg_image(entry: CohortEntry, dest: Path, sw: object) -> Any:

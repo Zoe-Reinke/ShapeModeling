@@ -31,6 +31,9 @@ from shape_modeling.io.reader import (
         ("Case38.mhd", "Case38"),
         ("Case38_segmentation.mhd", "Case38"),
         ("Case38_seg.nii.gz", "Case38"),
+        # NRRD masks (3D Slicer / NCI-ISBI exports) parse like any other flat file;
+        # separators are normalised to "_" (the structure token is stripped).
+        ("Prostate3T-01-0020_segmentation.nrrd", "Prostate3T_01_0020"),
         # Per-patient-dir layout: pure sequence/structure/reader tokens -> empty,
         # so discover_cases falls back to the directory name.
         ("t2.nii.gz", ""),
@@ -55,6 +58,7 @@ def test_parse_case_id(filename: str, expected: str) -> None:
         ("t2_anatomy_reader1.nii.gz", VolumeType.ORGAN_SEG),
         ("Case38_segmentation.mhd", VolumeType.ORGAN_SEG),
         ("Case38_mask.nii", VolumeType.ORGAN_SEG),
+        ("Prostate3T-01-0020_segmentation.nrrd", VolumeType.ORGAN_SEG),
         # Tumor / lesion tokens -> cancer (even alongside a sequence + reader).
         ("t2_tumor_reader1.nii.gz", VolumeType.CANCER_SEG),
         ("adc_tumor_reader2.nii.gz", VolumeType.CANCER_SEG),
@@ -127,6 +131,23 @@ def test_flat_layout_promise12_style(tmp_path: Path) -> None:
     assert len(case.organ_segs) == 1
     assert not case.cancer_segs
     assert case.geometry_consistent
+
+
+def test_flat_layout_nrrd_segmentation_only(tmp_path: Path) -> None:
+    """A held-out set of bare NRRD whole-gland masks (NCI-ISBI / MSD style).
+
+    No paired MRI and no sequence token -- the ``_segmentation`` token alone must classify
+    each ``.nrrd`` as an organ seg, so a validation cohort can be built from masks on disk.
+    """
+    _write_mask(tmp_path / "Prostate3T-01-0020_segmentation.nrrd")
+    _write_mask(tmp_path / "Prostate3T-01-0021_segmentation.nrrd")
+
+    ds = discover_cases(tmp_path)
+    assert len(ds) == 2
+    case = ds.cases[0]
+    assert not case.mris
+    assert len(case.organ_segs) == 1
+    assert not case.cancer_segs
 
 
 def test_per_patient_dir_layout(tmp_path: Path) -> None:
