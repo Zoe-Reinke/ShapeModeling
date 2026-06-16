@@ -227,12 +227,6 @@ ShapeWorks is **not pip-installable** — install it separately from
 <https://sciinstitute.github.io/ShapeWorks/> and run the correspondence step from its environment.
 Every other stage runs from the project venv.
 
-## Notebooks (drivers)
-
-Run the correspondence cell from the ShapeWorks environment; every other cell works from the
-project venv. The notebooks under `notebooks/` are exploratory drivers that wire the stages
-together and carry the confound diagnostics (site / acquisition / annotation), the harmonization
-before/after evidence, the group-difference test, and the mean/mode-shape visualisations.
 
 ## Scripts (production path)
 
