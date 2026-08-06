@@ -222,10 +222,12 @@ __marimo__/
 # ---------------------------------------------------------------------------
 
 # Input data (MRI volumes + segmentation masks) — never committed, fetched separately
+# (archived off-repo to /Volumes/Data2 during the 2026-08 cleanup)
 /PROMISE12/
 /Prostate158/
 /SAML/
 /PICAI/
+/Thyroid/
 
 # ShapeWorks run outputs (groomed volumes, particles, projects) — regenerated
 /shapeworks_work*/
@@ -234,6 +236,8 @@ __marimo__/
 # The exported model is a build artifact; release it separately if you need it versioned.
 /ssm_output*/
 /validation_*/
+/thyroid_ssm_output*/
+/thyroid_validation_*/
 
 # Held-out validation data (NCI-ISBI Prostate-3T, MSD Decathlon masks) — third-party data,
 # not redistributed; fetched separately like the other input datasets above.
