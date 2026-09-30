@@ -73,6 +73,14 @@ class ShapeWorksConfig:
     # the padded image (observed ~3.2), so this rejects e.g. a cache built before a grooming fix.
     # Set to None to disable the check.
     max_spread_ratio: float | None = 1.75
+    # Index (into the cohort) of the grooming reference shape. None = ShapeWorks'
+    # find_reference_image_index, which for > 30 shapes does NOT return the medoid (ShapeWorks
+    # <= 6.7.0 / master as of 2026-09: MeshUtils::findReferenceMesh takes the argmin over all
+    # shapes although only a random subset of 30 was compared, so an uncompared shape -- almost
+    # always index 0 -- wins). Compute the true medoid with shape_modeling.analysis.reference and
+    # pass its index here. Note: changing the reference changes grooming, so a cached
+    # particles.npz from a run with a different reference no longer matches -- use a new work_dir.
+    reference_index: int | None = None
 
 
 @dataclass
@@ -196,6 +204,26 @@ def _binary_seg_image(entry: CohortEntry, dest: Path, sw: object) -> Any:
     return sw.Image(str(seg_path))  # type: ignore[attr-defined]
 
 
+def _pregroom_binary(entry: CohortEntry, config: ShapeWorksConfig, dest: Path, sw: object) -> Any:
+    """Grooming step 1 for one subject: antialias -> iso resample -> re-binarize -> COM align.
+
+    Shared by :func:`_groom_cohort` and :mod:`shape_modeling.analysis.reference`, so the reference
+    selection sees exactly the pre-alignment shapes the grooming uses.
+    """
+    iso, anti = config.iso_spacing, config.antialias_iterations
+    img = _binary_seg_image(entry, dest, sw)
+    img.antialias(anti).resample(iso, sw.InterpolationType.Linear).binarize()  # type: ignore[attr-defined]
+    img.antialias(anti)
+    img.translate(img.center() - img.centerOfMass()).binarize()  # COM -> image centre
+    if _foreground_voxels(img) == 0:
+        raise ValueError(
+            f"case {entry.case_id!r}: groomed mask is EMPTY after antialias/resample/COM-align "
+            f"(antialias_iterations={anti}, iso_spacing={iso}). The organ mask is likely so "
+            "small that antialias + resample eroded it away -- check the QC volume for it."
+        )
+    return img
+
+
 def _groom_cohort(
     cohort: list[CohortEntry], config: ShapeWorksConfig, dest: Path, sw: object
 ) -> list[Path]:
@@ -228,22 +256,8 @@ def _groom_cohort(
     the binary mask (the final DT is recomputed after cropping). All subjects' images are held in
     memory at once (the cohort is ~10^2 cases); the per-image crop in step 3 keeps that bounded.
     """
-    iso, anti = config.iso_spacing, config.antialias_iterations
-
     # 1. antialias -> isotropic resample -> re-binarize -> centre-of-mass align (per subject).
-    binaries: list[Any] = []
-    for entry in cohort:
-        img = _binary_seg_image(entry, dest, sw)
-        img.antialias(anti).resample(iso, sw.InterpolationType.Linear).binarize()  # type: ignore[attr-defined]
-        img.antialias(anti)
-        img.translate(img.center() - img.centerOfMass()).binarize()  # COM -> image centre
-        if _foreground_voxels(img) == 0:
-            raise ValueError(
-                f"case {entry.case_id!r}: groomed mask is EMPTY after antialias/resample/COM-align "
-                f"(antialias_iterations={anti}, iso_spacing={iso}). The organ mask is likely so "
-                "small that antialias + resample eroded it away -- check the QC volume for it."
-            )
-        binaries.append(img)
+    binaries: list[Any] = [_pregroom_binary(entry, config, dest, sw) for entry in cohort]
 
     # 2. reference selection + rigid (ICP) alignment to it. ICP needs DTs; the transform it yields
     #    is applied to the binary mask, which is re-binarised to stay crisp.
@@ -256,7 +270,22 @@ def _groom_cohort(
     #    lands each gland where the reference gland sits, inside that frame by construction; padding
     #    the frame by pad_voxels leaves room for glands a little larger than the reference.
     dts = [b.copy().computeDT(0.5) for b in binaries]
-    ref_idx = sw.find_reference_image_index(dts)  # type: ignore[attr-defined]
+    if config.reference_index is not None:
+        ref_idx = int(config.reference_index)
+        if not 0 <= ref_idx < len(cohort):
+            raise ValueError(
+                f"ShapeWorksConfig.reference_index={ref_idx} out of range for {len(cohort)} shapes"
+            )
+        print(f"grooming reference: index {ref_idx} ({cohort[ref_idx].case_id}), set explicitly")
+    else:
+        if len(cohort) > 30:
+            print(
+                f"WARNING: {len(cohort)} shapes > 30 -- ShapeWorks' find_reference_image_index "
+                "does not return the medoid here (random-subset argmin bug); set "
+                "ShapeWorksConfig.reference_index (see shape_modeling.analysis.reference)."
+            )
+        ref_idx = sw.find_reference_image_index(dts)  # type: ignore[attr-defined]
+        print(f"grooming reference: index {ref_idx} ({cohort[ref_idx].case_id}), from ShapeWorks")
     ref = dts[ref_idx].copy()
     frame = binaries[ref_idx].copy().pad(config.pad_voxels, 0)  # common output grid for every shape
     out = (frame.origin(), frame.dims(), frame.spacing(), frame.coordsys())

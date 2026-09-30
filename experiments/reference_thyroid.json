@@ -1,0 +1,31 @@
+[
+  {
+    "task": "reference_prepare",
+    "comment": "array 0: rebuild the thyroid training cohort (as build_thyroid_ssm.py --holdout-frac 0.2 --holdout-seed 0 --exclude-file ...) and write the pre-alignment meshes; expect_sha256 = fingerprint of thyroid_ssm_output_excl_mm/cohort.csv (1054 lobes, s0002_L ... s1404_R)",
+    "out": "/home/zore25/Repositories/ShapeModeling/reference_thyroid_512p_excl",
+    "data": "/data/Data2/3D_THYROID_US/ShapeModel/data/Thyroid/Totalsegmentator_dataset_v201",
+    "exclude_file": "/home/zore25/Repositories/ShapeModeling/thyroid_excluded_subjects.txt",
+    "holdout_frac": 0.2,
+    "holdout_seed": 0,
+    "iso_spacing": 1.5,
+    "expect_sha256": "1f9bfffaca385d5e0f843d33d2e6554eb2689ecdf5b00fcd976cc8966dc48e63"
+  },
+  {
+    "task": "reference_selfcheck",
+    "comment": "array 1: our pair distance vs ShapeWorks findReferenceMesh(meshes[:40], 0); also shows the buggy default call on real data",
+    "out": "/home/zore25/Repositories/ShapeModeling/reference_thyroid_512p_excl",
+    "n_check": 40
+  },
+  {
+    "task": "reference_reduce",
+    "comment": "array 2: combine all chunks -> medoid, ranking.csv, reference.json",
+    "out": "/home/zore25/Repositories/ShapeModeling/reference_thyroid_512p_excl"
+  },
+  {
+    "task": "reference_pairs",
+    "comment": "array 100-299: all 554,931 pairs in 200 chunks (chunk = task id - 100)",
+    "out": "/home/zore25/Repositories/ShapeModeling/reference_thyroid_512p_excl",
+    "n_chunks": 200,
+    "chunk_from_task_id": 100
+  }
+]

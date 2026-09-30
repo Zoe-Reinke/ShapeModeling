@@ -1,0 +1,25 @@
+# Thyroid lobe subjects excluded from the SSM after visual QC review (2026-07-30).
+# Two failure types seen in their cohort volumes (L / R cm3, from thyroid_ssm_output/cohort.csv):
+#   grossly asymmetric pair -- mis-split lobe or goiter: s0927 18.1/44.7, s0898 7.4/18.8,
+#     s0844 1.5/8.4, s0809 1.2/6.0, s0970 4.6/10.7, s0303 19.2/12.5
+#   implausibly small lobe(s) that passed the 0.3 cm3 floor: s0950 0.66/0.42, s1281 0.81/0.41,
+#     s1147 1.07/0.85, s0824 0.69/1.12, s0808 0.52/1.68, s1008 1.70/0.55
+# Pass with: scripts/build_thyroid_ssm.py --exclude-file thyroid_excluded_subjects.txt
+# None of these are in thyroid_ssm_output/heldout.txt, so all 17 were in the training set.
+s0299
+s0303
+s0556
+s0592
+s0808
+s0809
+s0824
+s0844
+s0898
+s0927
+s0950
+s0970
+s1008
+s1147
+s1281
+s1400
+s1420

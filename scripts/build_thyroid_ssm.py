@@ -47,7 +47,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -55,13 +54,16 @@ import SimpleITK as sitk
 
 from shape_modeling.analysis import (
     CohortEntry,
+    ShapeModel,
     ShapeWorksConfig,
+    Surface,
     build_ssm,
     evaluate_ssm,
     export_model,
     gland_volume_cm3,
     gpa,
-    hull_surface,
+    qc_mesh,
+    reconstruct_surface,
     run_shapeworks,
 )
 from shape_modeling.analysis.correspondence import ParticleSystem, particle_spread_ratio
@@ -283,6 +285,38 @@ def build_cohort(
     return cohort, heldout_ids
 
 
+
+def mesh_connectivity(model: ShapeModel, *, n_samples: int = 50, seed: int = 0) -> np.ndarray:
+    """Surface topology for the exported model, QC-gated on the mean *and* on instances.
+
+    ``reconstruct_surface`` carves a real (concavity-following) mesh through the mean's
+    particles, so the faces index every correspondence point and stay valid for any shape
+    coefficients. The mean's mesh is watertight by construction, which is exactly why checking
+    only the mean proves nothing -- a convex hull passes that too. So the gate also samples
+    shapes from the model (``b ~ N(0, 1)`` clamped to the +-3 sd box) and re-runs
+    :func:`qc_mesh` on each: those vertices move, and a bad topology folds in on itself there.
+    """
+    surface = reconstruct_surface(model.mean)
+    report = qc_mesh(surface)
+    print(f"mean mesh QC: {report.summary()}")
+    if not report.ok:
+        raise SystemExit(f"reconstructed mean mesh failed QC -- not exporting it: {report}")
+
+    rng = np.random.default_rng(seed)
+    k = min(model.n_modes, 60)
+    sd = np.sqrt(model.eigenvalues[:k])
+    bad = 0
+    for _ in range(n_samples):
+        weights = np.clip(rng.normal(size=k), -3.0, 3.0)
+        pts = model.mean + ((weights * sd) @ model.components[:k]).reshape(model.mean.shape)
+        if not qc_mesh(Surface(verts=pts, faces=surface.faces)).ok:
+            bad += 1
+    print(f"instance mesh QC: {n_samples - bad}/{n_samples} sampled shapes clean")
+    if bad:
+        print(f"  WARNING: {bad} sampled shapes self-intersect or tear with this topology")
+    return surface.faces
+
+
 def main() -> None:
     args = parse_args()
     work_dir = args.work_dir or Path(f"shapeworks_work_thyroid_final_{args.num_particles}p")
@@ -353,7 +387,7 @@ def main() -> None:
         "n_excluded_subjects": len(exclude),
         "excluded_subjects": sorted(exclude),
     }
-    faces = hull_surface(model.mean).faces  # quick convex-hull connectivity for viewing
+    faces = mesh_connectivity(model)
     model_path = export_model(model, out / "model.npz", faces=faces, units=units, metadata=metadata)
     print(f"wrote {model_path}")
 

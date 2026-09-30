@@ -16,14 +16,18 @@ the mean, ``|b_k| <= 3`` spans the plausible range of the cohort. These are the 
 optimiser turns. :meth:`ExportedModel.instance` evaluates this; :meth:`ExportedModel.clamp`
 enforces the plausibility box.
 
-Pose at fit time. The model is built on :func:`~shape_modeling.analysis.ssm.gpa`-aligned
-shapes with ``scale=True``, so the mean is **pose-free and unitless** (unit Frobenius norm,
-~0.0x coordinates, *not* mm). To match it to a real anatomy in millimetre world coordinates
-you therefore solve a 7-DOF similarity (uniform scale, rotation, translation) *alongside* the
-shape weights. :meth:`ExportedModel.fit` does exactly this -- alternating a pose solve and a
-shape-weight solve -- and :meth:`ExportedModel.instance` applies a ``(scale, rotation,
-translation)`` pose when given one. The unitless model is the deliberate choice (it decouples
-size from shape; see CLAUDE.md): downstream code owns the scale.
+Pose at fit time, and what :attr:`ExportedModel.units` decides. A model built on
+:func:`~shape_modeling.analysis.ssm.gpa`-aligned shapes with ``scale=True`` has a mean that is
+**pose-free and unitless** (unit Frobenius norm, ~0.0x coordinates, *not* mm), so matching it
+to a real anatomy in millimetre world coordinates means solving a 7-DOF similarity (uniform
+scale, rotation, translation) *alongside* the shape weights: downstream code owns the scale,
+which decouples size from shape (see CLAUDE.md). A ``gpa(scale=False)`` model instead carries
+its cohort's real millimetre size in the modes, and there the pose must be **6-DOF rigid** --
+a similarity pose would rescale the model onto each target and discard exactly the size the
+model was built to keep. :meth:`ExportedModel.fit` and :meth:`ExportedModel.fit_surface`
+alternate a pose solve with a shape-weight solve and pick the right pose family from
+:attr:`ExportedModel.units` by default (``fit_scale`` overrides it);
+:meth:`ExportedModel.instance` applies a ``(scale, rotation, translation)`` pose when given one.
 """
 
 from __future__ import annotations
@@ -121,6 +125,20 @@ class ExportedModel:
     def n_modes(self) -> int:
         return self.components.shape[0]
 
+    @property
+    def units(self) -> str:
+        """Coordinate frame of the model: ``"mm"`` or ``"normalized"`` (unitless).
+
+        Recorded by :func:`export_model` from the GPA that built it. It is not cosmetic: it
+        decides how many pose degrees of freedom the fit helpers solve (see :meth:`fit`).
+        Models exported before this field existed report ``"normalized"``.
+        """
+        return str(self.metadata.get("units", "normalized"))
+
+    def _resolve_fit_scale(self, fit_scale: bool | None) -> bool:
+        """Whether the pose solve may rescale: explicit choice, else off for a ``"mm"`` model."""
+        return self.units != "mm" if fit_scale is None else bool(fit_scale)
+
     def instance(
         self, weights: np.ndarray | None = None, *, pose: Pose | None = None
     ) -> np.ndarray:
@@ -162,6 +180,7 @@ class ExportedModel:
         pose: bool = True,
         n_iter: int = 10,
         max_sd: float = 3.0,
+        fit_scale: bool | None = None,
     ) -> FitResult:
         """Fit shape weights (and, by default, a similarity pose) to a target point set.
 
@@ -178,6 +197,12 @@ class ExportedModel:
         ``pose=False`` skips step 1 (use when ``target`` is already in the model's unitless
         frame). ``n_modes`` limits how many modes the fit may move (defaults to all). The
         returned :class:`FitResult` carries the weights, the pose, the posed points, and RMSE.
+
+        ``fit_scale`` controls step 1's degrees of freedom and defaults to :attr:`units`: a
+        ``"normalized"`` model solves the full 7-DOF similarity (it has no size of its own, so
+        the pose must supply one), a ``"mm"`` model solves 6-DOF **rigid** only -- pinning
+        ``scale = 1`` is what makes the model's own size act as a prior instead of being
+        rescaled away. Override it to force either behaviour.
         """
         tgt = np.asarray(target, dtype=np.float64)
         if tgt.shape != self.mean.shape:
@@ -188,13 +213,14 @@ class ExportedModel:
         k = self.n_modes if n_modes is None else min(n_modes, self.n_modes)
         sqrt_lambda = np.sqrt(self.eigenvalues[:k])
         comps = self.components[:k]  # (k, 3M), unit vectors
+        allow_scale = self._resolve_fit_scale(fit_scale)
 
         b = np.zeros(k)
         scale, rot, translation = 1.0, np.eye(3), np.zeros(3)
         for _ in range(n_iter):
             x = self.instance(b)  # current shape, model frame
             if pose:
-                scale, rot, translation = _similarity_fit(x, tgt)  # x -> target
+                scale, rot, translation = _similarity_fit(x, tgt, allow_scale=allow_scale)
                 # Pull the target back into the model frame: invert s*(x@R.T)+t.
                 tgt_model = ((tgt - translation) / scale) @ rot
             else:
@@ -224,6 +250,7 @@ class ExportedModel:
         max_sd: float = 3.0,
         n_restarts: int = 4,
         init_pose: Pose | None = None,
+        fit_scale: bool | None = None,
     ) -> SurfaceFitResult:
         """Fit shape weights + a similarity pose to a **non-corresponded** target surface.
 
@@ -250,6 +277,11 @@ class ExportedModel:
         search. The returned :class:`SurfaceFitResult` carries the weights, pose, fitted points,
         and the symmetric surface distance to the target -- the number to report for validation.
 
+        ``fit_scale`` sets the pose's degrees of freedom and defaults to :attr:`units`, exactly
+        as in :meth:`fit`: 7-DOF similarity for a ``"normalized"`` model, 6-DOF **rigid** for a
+        ``"mm"`` one, whose own millimetre size then constrains the fit (the initialisations are
+        pinned to ``scale = 1`` too, so a rigid fit never starts from a rescaled pose).
+
         Clean the mask and extract its surface before calling; this method does no smoothing.
         """
         verts = target.verts if isinstance(target, Surface) else target
@@ -260,12 +292,13 @@ class ExportedModel:
         k = self.n_modes if n_modes is None else min(n_modes, self.n_modes)
         sqrt_lambda = np.sqrt(self.eigenvalues[:k])
         comps = self.components[:k]  # (k, 3M)
+        allow_scale = self._resolve_fit_scale(fit_scale)
         tree = cKDTree(tgt)
 
         inits = (
             [init_pose]
             if init_pose is not None
-            else _init_surface_poses(self.mean, tgt, n_restarts)
+            else _init_surface_poses(self.mean, tgt, n_restarts, allow_scale=allow_scale)
         )
 
         best: SurfaceFitResult | None = None
@@ -280,7 +313,7 @@ class ExportedModel:
                 posed = scale * (x @ np.asarray(rot).T) + np.asarray(translation)
                 dist, idx = tree.query(posed)
                 matched = tgt[idx]  # (M, 3) pseudo-correspondence in the target frame
-                scale, rot, translation = _similarity_fit(x, matched)  # x -> matched
+                scale, rot, translation = _similarity_fit(x, matched, allow_scale=allow_scale)
                 matched_model = ((matched - translation) / scale) @ rot  # pull back to model frame
                 resid = (matched_model - self.mean).reshape(-1)
                 b = self.clamp((comps @ resid) / sqrt_lambda, n_sd=max_sd)
@@ -321,8 +354,13 @@ def export_model(
 
     Stores the mean, principal modes, eigenvalues, and explained-variance ratio, plus optional
     mesh ``faces`` (shared connectivity so vertex ``j`` is comparable across reconstructions --
-    e.g. ``hull_surface(model.mean).faces`` or a :func:`warp_surface` template's faces) and a
-    free-form ``metadata`` dict (provenance: cohort, harmonization, date).
+    use ``reconstruct_surface(model.mean).faces``) and a free-form ``metadata`` dict
+    (provenance: cohort, harmonization, date).
+
+    Do **not** pass ``hull_surface(model.mean).faces`` here: a convex hull cannot represent an
+    organ's concavities, and it drops every point that is not a hull vertex (119 of 512 for the
+    thyroid lobe model), so the stored mesh is unusable as a real surface even though it looks
+    closed. ``hull_surface`` is for quick mode-shape *viewing* only.
 
     ``units`` records the coordinate frame the model lives in -- ``"normalized"`` for a
     ``gpa(scale=True)`` model (unitless ~0.0x coords; uniform scale must be recovered at fit
@@ -422,17 +460,22 @@ def _principal_axes(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
     return mu, vt.T, size
 
 
-def _init_surface_poses(mean: np.ndarray, target: np.ndarray, n_restarts: int) -> list[Pose]:
+def _init_surface_poses(
+    mean: np.ndarray, target: np.ndarray, n_restarts: int, *, allow_scale: bool = True
+) -> list[Pose]:
     """Initial similarity poses aligning the model's principal frame onto the target's.
 
     The two principal frames match only up to an axis-sign ambiguity, so one pose is emitted per
     proper-rotation (det=+1) sign flip -- up to ``n_restarts`` of them. ICP then refines each and
     the caller keeps the best, making :meth:`ExportedModel.fit_surface` robust to an arbitrarily
     oriented target without a manual initial guess.
+
+    ``allow_scale=False`` keeps every initialisation at ``scale = 1`` (a millimetre model starts
+    at its own size rather than being stretched onto the target's centroid size).
     """
     mu_m, axes_m, size_m = _principal_axes(np.asarray(mean, dtype=np.float64))
     mu_t, axes_t, size_t = _principal_axes(np.asarray(target, dtype=np.float64))
-    scale = size_t / size_m if size_m > 0 else 1.0
+    scale = (size_t / size_m if size_m > 0 else 1.0) if allow_scale else 1.0
 
     # Keep only sign flips that make R = (flipped target axes) @ model axes^T a proper rotation.
     need = float(np.sign(np.linalg.det(axes_t) * np.linalg.det(axes_m))) or 1.0

@@ -1,0 +1,38 @@
+--- a/Libs/Mesh/MeshUtils.cpp
++++ b/Libs/Mesh/MeshUtils.cpp
+@@ -246,7 +246,8 @@
+ 
+   std::vector<double> means(meshes.size(), 0);
+ 
+-  double count = meshes.size() - 1;
++  // each compared mesh takes part in (num_meshes - 1) pairs
++  double count = num_meshes - 1;
+   for (size_t i = 0; i < pairs.size(); i++) {
+     auto pair = pairs[i];
+     double result = results[i];
+@@ -254,9 +255,22 @@
+     means[pair.second] += result / count;
+   }
+ 
+-  auto smallest = std::min_element(means.begin(), means.end());
+-
+-  return std::distance(means.begin(), smallest);
++  // Only meshes that were actually compared are candidates. Meshes outside the random subset
++  // keep mean 0 and would otherwise always win the argmin.
++  std::vector<int> candidates;
++  if (use_random_subset) {
++    candidates = subset;
++  } else {
++    candidates.resize(meshes.size());
++    std::iota(candidates.begin(), candidates.end(), 0);
++  }
++  int best = candidates[0];
++  for (int idx : candidates) {
++    if (means[idx] < means[best]) {
++      best = idx;
++    }
++  }
++  return best;
+ }
+ 
+ /*

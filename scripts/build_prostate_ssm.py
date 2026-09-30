@@ -45,7 +45,7 @@ from shape_modeling.analysis import (
     evaluate_ssm,
     export_model,
     gpa,
-    hull_surface,
+    reconstruct_surface,
     run_shapeworks,
 )
 from shape_modeling.analysis.correspondence import ParticleSystem, particle_spread_ratio
@@ -206,7 +206,7 @@ def main() -> None:
         "combat_harmonized_on_centre": harmonize,
         "spread_ratio": round(spread, 3),
     }
-    faces = hull_surface(model.mean).faces  # quick convex-hull connectivity for viewing
+    faces = reconstruct_surface(model.mean).faces  # real (concavity-following) topology
     model_path = export_model(model, out / "model.npz", faces=faces, units=units, metadata=metadata)
     print(f"wrote {model_path}")
 

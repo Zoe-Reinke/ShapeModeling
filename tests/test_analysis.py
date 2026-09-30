@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import SimpleITK as sitk
+from scipy.spatial import ConvexHull
 
 from shape_modeling.analysis import (
     CleanConfig,
@@ -32,6 +33,8 @@ from shape_modeling.analysis import (
     load_model,
     load_shapeworks_evaluation,
     mode_shape,
+    qc_mesh,
+    reconstruct_surface,
     save_ply,
     smooth_surface,
     specificity,
@@ -47,7 +50,7 @@ from shape_modeling.analysis.correspondence import (
     particle_spread_ratio,
 )
 from shape_modeling.analysis.evaluation import SSMEvaluation, default_mode_grid
-from shape_modeling.analysis.surface import Surface
+from shape_modeling.analysis.surface import Surface, _similarity_fit
 from shape_modeling.io.reader import LoadedVolume, VolumeType
 
 # --------------------------------------------------------------------------- #
@@ -281,6 +284,94 @@ def test_hull_surface_closed_triangulation() -> None:
     n_hull_verts = len(np.unique(surf.faces))
     assert surf.faces.shape[0] == 2 * n_hull_verts - 4
 
+
+def _union_of_spheres(n: int = 500, offset: float = 0.9) -> np.ndarray:
+    """Surface samples of two overlapping unit spheres -- a waist a convex hull bridges over."""
+    rng = np.random.default_rng(3)
+    centres = np.array([[-offset, 0.0, 0.0], [offset, 0.0, 0.0]])
+    halves = []
+    for own, other in (centres, centres[::-1]):
+        dirs = rng.normal(size=(4 * n, 3))
+        dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
+        on_sphere = dirs + own
+        halves.append(on_sphere[np.linalg.norm(on_sphere - other, axis=1) > 1.0][: n // 2])
+    return np.concatenate(halves)
+
+
+def _enclosed_volume(verts: np.ndarray, faces: np.ndarray) -> float:
+    """Divergence-theorem volume; assumes a closed, consistently wound mesh."""
+    a, b, c = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
+    return abs(float(np.einsum("ij,ij->i", a, np.cross(b, c)).sum() / 6.0))
+
+
+def test_reconstruct_surface_uses_every_point_and_is_watertight() -> None:
+    pts = _union_of_spheres()
+    surf = reconstruct_surface(pts)
+
+    assert np.array_equal(surf.verts, pts)  # vertices are the input points, in order
+    assert surf.faces.max() < len(pts)
+    assert len(np.unique(surf.faces)) == len(pts)  # every correspondence point is on the mesh
+    assert len(surf.faces) == 2 * len(pts) - 4  # closed genus-0 triangulation (Euler)
+
+    report = qc_mesh(surf)
+    assert report.ok
+    assert report.is_watertight and report.is_edge_manifold and report.is_vertex_manifold
+    assert report.is_consistently_oriented and not report.is_self_intersecting
+    assert report.n_unreferenced_vertices == 0
+
+
+def test_reconstruct_surface_follows_a_concavity_the_hull_bridges() -> None:
+    pts = _union_of_spheres()
+    rec = reconstruct_surface(pts)
+
+    # Two unit spheres at +-0.9 enclose 8.33 units^3 (spheres minus their lens); a mesh through
+    # surface samples is inscribed, so it lands just under. The convex hull fills the waist in.
+    rec_volume = _enclosed_volume(rec.verts, rec.faces)
+    assert 0.93 * 8.33 < rec_volume < 8.33
+    assert ConvexHull(pts).volume > 1.13 * rec_volume
+
+    # The hull also throws points away -- the defect that made the exported mesh unusable.
+    hull_report = qc_mesh(hull_surface(pts))
+    assert hull_report.n_unreferenced_vertices > 0
+    assert not hull_report.ok
+
+
+def test_reconstruct_surface_topology_transfers_to_another_shape() -> None:
+    """The point of a fixed face list: it stays valid when the SSM moves the vertices."""
+    pts = _union_of_spheres()
+    faces = reconstruct_surface(pts).faces
+    stretched = pts * np.array([1.4, 0.9, 1.0])  # a plausible mode-like deformation
+
+    report = qc_mesh(Surface(verts=stretched, faces=faces))
+    assert report.ok
+    assert np.array_equal(faces, reconstruct_surface(pts).faces)  # deterministic
+
+
+def test_qc_mesh_detects_a_fold_and_a_flipped_face() -> None:
+    pts = _union_of_spheres(n=250)
+    surf = reconstruct_surface(pts)
+
+    folded = surf.verts.copy()
+    folded[0] = -1.5 * folded[0]  # drag one vertex through the opposite wall
+    assert qc_mesh(Surface(verts=folded, faces=surf.faces)).is_self_intersecting
+
+    flipped = surf.faces.copy()
+    flipped[0] = flipped[0][::-1]
+    report = qc_mesh(Surface(verts=surf.verts, faces=flipped))
+    assert not report.is_consistently_oriented  # winding no longer agrees across the edge
+    assert report.is_orientable  # ...but it can be rewound: the surface itself is fine
+
+
+def test_reconstruct_surface_rejects_bad_input() -> None:
+    with pytest.raises(ValueError, match="expected"):
+        reconstruct_surface(np.zeros((10, 2)))
+    with pytest.raises(ValueError, match="at least 4 points"):
+        reconstruct_surface(np.zeros((3, 3)))
+    # A flat (or collapsed) cloud has no interior to carve -- refused with a readable error
+    # rather than a raw QhullError, and never silently meshed the way a hull would be.
+    flat = np.random.default_rng(0).normal(size=(40, 3)) * np.array([1.0, 1.0, 0.0])
+    with pytest.raises(ValueError, match="degenerate"):
+        reconstruct_surface(flat)
 
 def test_warp_surface_keeps_faces_and_lands_on_target() -> None:
     rng = np.random.default_rng(11)
@@ -711,6 +802,92 @@ def test_fit_surface_accepts_surface_and_honours_init_pose() -> None:
     assert result.mean_distance < 0.05
     assert result.weights[0] == pytest.approx(1.5, abs=0.1)
     assert result.weights[1] == pytest.approx(-1.0, abs=0.1)
+
+
+def _mm_model(model: ShapeModel) -> ExportedModel:
+    """Wrap a ShapeModel as an ExportedModel that declares millimetre units."""
+    return ExportedModel(
+        mean=model.mean,
+        components=model.components,
+        eigenvalues=model.eigenvalues,
+        explained_variance_ratio=model.explained_variance_ratio,
+        metadata={"units": "mm"},
+    )
+
+
+def test_units_defaults_to_normalized_and_selects_the_pose_family() -> None:
+    model = _ellipsoid_model()
+    assert load_model_from(model).units == "normalized"  # no metadata -> legacy default
+    assert _mm_model(model).units == "mm"
+
+
+def test_export_model_records_mm_units(tmp_path: Path) -> None:
+    loaded = load_model(export_model(_single_mode_model(), tmp_path / "ssm", units="mm"))
+    assert loaded.units == "mm"
+    assert loaded.metadata["units"] == "mm"
+
+
+def test_mm_model_fits_rigidly_and_keeps_its_own_size() -> None:
+    """A "mm" model solves 6-DOF: it recovers a rigidly posed target without rescaling."""
+    loaded = _mm_model(_ellipsoid_model())
+    rot = _rotation((0.2, -0.3, 0.4))
+    truth = loaded.instance([1.5, -1.0], pose=(1.0, rot, np.array([5.0, -2.0, 7.0])))
+
+    result = loaded.fit_surface(truth, n_modes=2, n_iter=100)
+
+    assert result.scale == 1.0  # pinned exactly, not merely close
+    assert result.mean_distance < 0.05
+    assert result.weights[0] == pytest.approx(1.5, abs=0.1)
+    assert result.weights[1] == pytest.approx(-1.0, abs=0.1)
+
+
+def test_mm_model_refuses_to_rescale_onto_a_resized_target() -> None:
+    """The size prior bites: a 1.5x target is not absorbed by the pose, unlike a unitless model."""
+    model = _ellipsoid_model()
+    truth = load_model_from(model).instance([1.0, -0.5], pose=(1.5, np.eye(3), np.zeros(3)))
+
+    rigid = _mm_model(model).fit_surface(truth, n_modes=2, n_iter=100)
+    similarity = load_model_from(model).fit_surface(truth, n_modes=2, n_iter=100)
+
+    assert rigid.scale == 1.0
+    assert similarity.scale == pytest.approx(1.5, rel=0.05)  # unitless model swallows the size
+    assert rigid.mean_distance > similarity.mean_distance  # the mm model pays for the size gap
+
+
+def test_fit_scale_overrides_the_units_default() -> None:
+    model = _ellipsoid_model()
+    truth = load_model_from(model).instance([1.0, -0.5], pose=(1.5, np.eye(3), np.zeros(3)))
+
+    forced = _mm_model(model).fit_surface(truth, n_modes=2, n_iter=100, fit_scale=True)
+    pinned = load_model_from(model).fit_surface(truth, n_modes=2, n_iter=100, fit_scale=False)
+
+    assert forced.scale == pytest.approx(1.5, rel=0.05)  # mm model told to solve scale anyway
+    assert pinned.scale == 1.0  # unitless model told not to
+
+
+def test_corresponded_fit_honours_rigid_units() -> None:
+    loaded = _mm_model(_two_mode_model())
+    rot = _rotation((0.2, 0.4, -0.3))
+    target = loaded.instance([1.0, -0.5], pose=(1.0, rot, np.array([4.0, 8.0, -2.0])))
+
+    result = loaded.fit(target, n_modes=2, n_iter=30)
+
+    assert result.scale == 1.0
+    assert result.weights[0] == pytest.approx(1.0, abs=1e-2)
+    assert result.rmse < 1e-4
+
+
+def test_rigid_similarity_fit_is_the_umeyama_rotation_without_scale() -> None:
+    rng = np.random.default_rng(5)
+    src = rng.normal(size=(40, 3))
+    rot = _rotation((0.3, -0.1, 0.2))
+    dst = 2.0 * (src @ rot.T) + np.array([1.0, 2.0, 3.0])  # a deliberately rescaled target
+
+    scale, r, t = _similarity_fit(src, dst, allow_scale=False)
+
+    assert scale == 1.0
+    np.testing.assert_allclose(r, rot, atol=1e-9)  # rotation is unaffected by the pinned scale
+    np.testing.assert_allclose(t, dst.mean(0) - (r @ src.mean(0)), atol=1e-9)
 
 
 # --------------------------------------------------------------------------- #

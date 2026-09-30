@@ -1,0 +1,274 @@
+================================================================================
+THYROID LOBE STATISTICAL SHAPE MODEL — BRIEFING FOR 3D ULTRASOUND RECONSTRUCTION
+================================================================================
+Purpose: context for a Claude conversation about using this model as a shape
+prior to optimize 3D ultrasound (US) reconstruction of the thyroid lobe.
+Everything below is factual about the model as built and validated. Model file:
+  thyroid_ssm_output_excl/model.npz   (plus a viewer copy of the ShapeWorks project
+  in thyroid_ssm_output_excl/shapeworks_model/)
+
+--------------------------------------------------------------------------------
+1. TL;DR
+--------------------------------------------------------------------------------
+- It is a linear PCA shape model of ONE thyroid lobe: a mean lobe plus orthogonal
+  deformation modes. Any plausible lobe = mean + a few weighted modes.
+- It is SIDE-AGNOSTIC: left and right lobes were pooled into a single model by
+  mirroring every right lobe into the left lobe's chiral frame. One model
+  reconstructs either side.
+- It is exported as a plain .npz and reloads with NUMPY ONLY — no ShapeWorks, no
+  scikit-learn, none of the build stack needed to USE it.
+- The intended deployment is exactly 3D-US reconstruction: given a raw,
+  partial, or noisy lobe surface, fit the model to recover a complete, smooth,
+  anatomically-plausible lobe surface plus a low-dimensional shape code.
+- Built on CT (TotalSegmentator) segmentations, healthy + goiter anatomy. It has
+  NOT been trained on ultrasound — read the caveats in section 8.
+
+--------------------------------------------------------------------------------
+2. MODEL FACTS (from summary.json / validation)
+--------------------------------------------------------------------------------
+organ                : thyroid_lobe (single lobe, NOT the whole gland, NO isthmus)
+side_agnostic        : true
+chirality_frame      : left; right lobes mirrored in
+mirror_axis          : 2  (SimpleITK array axis z,y,x -> axis 2 = physical x = L/R)
+num_particles/points : 512 corresponded points per lobe  (mean is (512, 3))
+iso_spacing          : 1.5 mm (grooming resample; also the effective voxel floor)
+gpa_scale            : true  -> units = "normalized" (UNITLESS, size removed)
+training cohort      : 1054 lobes (527 left + 527 right) from 527 subjects,
+                       after excluding 17 visually QC-failed subjects and a
+                       141-subject held-out split (see section 11)
+correspondence       : ShapeWorks 512 particles / 1000 iterations,
+                       spread ratio 0.882 (healthy ~1.0-1.3)
+n_modes (max)        : 1053
+compactness          : 5 modes -> 90% variance, 10 -> 95%, 90 -> 99%
+                       (mode 1 ~39%, mode 2 ~19%: variance is spread out, and
+                        mode 1 is NOT a size mode because scale was normalized out)
+generalization       : 0.465 mm @ 15 modes (leave-one-out, world particles)
+specificity          : 1.21 mm @ 15 modes
+
+Practical model dimensionality: use ~10-15 modes for a faithful-but-regularized
+fit. The held-out validation used 15 modes.
+
+--------------------------------------------------------------------------------
+3. COORDINATE FRAMES & UNITS  (critical — read before fitting)
+--------------------------------------------------------------------------------
+- The model is UNITLESS ("normalized") because it was built with GPA scale=True.
+  Its coordinates are ~0.0x, not mm. To match it to a real anatomy in mm you must
+  solve a 7-DOF SIMILARITY (scale + rotation + translation) at fit time. The fit
+  helpers do this for you (they return the pose).
+- The model lives in a LEFT-chiral frame. A similarity transform CANNOT reflect,
+  so a RIGHT lobe must be mirrored into the left frame before fitting:
+      RIGHT lobe:  target[:, 0] = -target[:, 0]   (reflect physical x), then fit
+      LEFT  lobe:  fit as-is
+  Your US scans carry the L/R label, so mirror DETERMINISTICALLY by side (do not
+  guess). After fitting a right lobe, reflect the fitted points' x back
+  (points[:, 0] = -points[:, 0]) to return them to the true anatomical frame.
+- Inputs are physical-mm point clouds (x, y, z). A surface from a mask is
+  extract_surface(clean_mask(mask), geom).verts. For US, supply the reconstructed
+  lobe surface as an (N, 3) mm point cloud in any order/pose — the fit re-estimates
+  correspondence and pose.
+
+--------------------------------------------------------------------------------
+4. THE FILE AND HOW TO LOAD IT  (numpy only)
+--------------------------------------------------------------------------------
+from shape_modeling.analysis import load_model        # or copy export.py; numpy-only
+m = load_model("thyroid_ssm_output_excl/model.npz")
+
+Attributes:
+  m.mean                     (M, 3)  = (512, 3) mean lobe, model frame
+  m.components               (K, 3M) unit principal modes phi_k
+  m.eigenvalues              (K,)    variance lambda_k along each mode
+  m.explained_variance_ratio (K,)
+  m.faces                    (F, 3)  connectivity for viewing ONLY (convex hull —
+                                     a coarse blob, do NOT treat as a faithful mesh)
+  m.metadata                 dict    (units, mirror_axis, num_particles, ...)
+  m.n_points  -> 512
+  m.n_modes   -> 1053
+
+Reconstruction math (what instance() computes):
+  x = mean + sum_k ( b_k * sqrt(lambda_k) * phi_k )
+  b_k are weights in STANDARD-DEVIATION units: b_k = 0 is the mean, |b_k| <= 3 is
+  the plausible range.
+
+--------------------------------------------------------------------------------
+5. API FOR RECONSTRUCTION
+--------------------------------------------------------------------------------
+m.instance(weights=None, *, pose=None) -> (M, 3)
+    Reconstruct a shape from SD-unit weights (may be shorter than n_modes; rest
+    held at the mean; None returns the mean). If pose=(scale, R, t) is given,
+    returns scale*(x @ R.T) + t in the target frame.
+
+m.clamp(weights, *, n_sd=3.0) -> weights clipped to the +/- n_sd plausible box.
+
+m.surface(weights=None, *, pose=None) -> Surface(verts, faces)  [needs faces]
+
+m.fit(target, *, n_modes=None, pose=True, n_iter=10, max_sd=3.0) -> FitResult
+    Use when target is IN CORRESPONDENCE with the model (M points, same ordering).
+    Not the usual US case.
+
+m.fit_surface(target, *, n_modes=None, n_iter=50, tol=1e-4, max_sd=3.0,
+              n_restarts=4, init_pose=None) -> SurfaceFitResult
+    *** THIS IS THE 3D-US ENTRY POINT. ***
+    target = an (N, 3) NON-corresponded mm point cloud (any N, any order/pose),
+    or a Surface. Runs iterated-closest-point with a shape solve inside the loop:
+    each iteration poses the current instance, matches each model point to its
+    nearest target point (pseudo-correspondence, re-estimated every iteration),
+    then re-solves the Umeyama similarity pose AND the mode weights (clamped to
+    +/- max_sd). Runs from n_restarts principal-axis initializations and keeps the
+    lowest-distance result. Pass init_pose to skip the restart search when the
+    target is already roughly aligned (faster, avoids flip ambiguity).
+
+SurfaceFitResult fields:
+    weights        (K,)    SD-unit mode weights — the low-dimensional shape code
+    scale, rotation (3,3), translation (3,)   the recovered 7-DOF pose
+    pose           property -> (scale, rotation, translation)
+    points         (M, 3)  the FITTED lobe, posed into the target frame  <-- the
+                           reconstructed surface you want
+    mean_distance  float   symmetric mean surface distance to target (mm) — headline
+    rms_distance   float
+    hausdorff95    float   symmetric 95th-pct surface distance (mm)
+    n_iter, converged      ICP iterations run / whether it hit tol before n_iter
+
+--------------------------------------------------------------------------------
+6. HOW TO USE IT TO OPTIMIZE 3D-US RECONSTRUCTION
+--------------------------------------------------------------------------------
+The model is a low-dimensional, anatomically-constrained manifold of lobe shapes.
+Fitting projects a noisy/partial US surface ONTO that manifold, which:
+  - completes missing regions (acoustic shadow, out-of-plane gaps, sparse sweeps),
+  - denoises / smooths speckle and segmentation jaggedness,
+  - yields a compact shape code (the weights) + a pose, instead of a raw mesh,
+  - guarantees the result is a plausible thyroid lobe (weights clamped to +/-3 SD).
+
+Typical pipeline for one lobe:
+  1. Build an (N, 3) mm point cloud of the lobe surface from the US volume
+     (segmentation surface, or tracked freehand-US points). No smoothing needed —
+     fit_surface does not smooth, but it is robust to noise via the shape prior.
+  2. If it is the RIGHT lobe: reflect x  (cloud[:, 0] = -cloud[:, 0]).
+  3. fit = m.fit_surface(cloud, n_modes=..., n_restarts=...).
+  4. reconstruction = fit.points  (M=512 points). For the RIGHT lobe, reflect x
+     back to the patient's true frame.
+  5. Report fit.mean_distance / hausdorff95 as agreement; fit.weights as the shape
+     descriptor; fit.pose to place the model in patient/scanner coordinates.
+
+Where the prior helps MOST: exactly where US is worst — shadowed posterior
+surface, the deep/medial border against the trachea, and interpolation between
+widely spaced 2D frames. The completed surface uses population statistics to fill
+what the beam could not see.
+
+Optimization levers (the trade-off is prior-strength vs patient-specificity):
+  - n_modes: FEWER modes = stronger regularization (smoother, closer to the mean,
+    ignores noise) but less patient detail; MORE modes = closer to the data but can
+    chase speckle. Start ~10-15. For very noisy/partial US, drop to ~5-9.
+  - max_sd: tighter clamp (e.g. 2.5) forces more typical shapes; looser (3+) allows
+    extremes (goiters) but admits noise.
+  - n_restarts: more restarts guards against ICP local minima / axis flips; if you
+    already have a rough pose (e.g. from probe tracking), pass init_pose and set a
+    single restart to save time and avoid flip ambiguity.
+  - iso / point density of the target cloud: 1.5 mm sampling matches the model's
+    resolution; much denser buys little.
+
+You can also use the model beyond one-shot fitting:
+  - as a REGULARIZER inside a US segmentation/reconstruction objective (penalize
+    deviation of the surface from the nearest model instance, i.e. |b|^2 in SD
+    units),
+  - to INITIALIZE registration/segmentation (mean lobe posed by fit.pose),
+  - to INTERPOLATE / extrapolate a partial sweep to a full surface,
+  - to compress a reconstructed lobe to a handful of weights for downstream stats.
+
+--------------------------------------------------------------------------------
+7. EXPECTED ACCURACY  (held-out CT validation, known-side, 15 modes)
+--------------------------------------------------------------------------------
+On 279 held-out lobes the exported model never saw (141 held-out subjects,
+deterministic mirror by known side, one fit_surface each; 2 empty masks dropped by
+the volume gate and 1 confirmed whole-gland fusion, s0650_R, excluded):
+    mean surface distance  : median 1.01 mm, mean 1.03 mm, p95 1.38 mm, max 3.01 mm
+    convergence            : ~94% (remainder hit the 50-iter cap, mostly large goiters)
+    per side               : L median 0.97 mm, R median 1.03 mm (n=139 / 141)
+Numbers from thyroid_validation_knownside_output_excl/summary.json. The earlier
+model built WITHOUT the 17 QC exclusions scored median 1.11 / mean 1.15 / p95 1.55
+on the identical held-out subjects; the rebuild is better on 274 of 279 lobes
+(Wilcoxon p=3.2e-47), so the exclusion is a real deployment gain.
+This is at the 1.5 mm voxel floor of the CT masks — near the best achievable given
+the input resolution. Treat it as an OPTIMISTIC ceiling for US: US surfaces are
+noisier and often partial, so real US agreement will be looser, but that is also
+precisely where the prior adds the most value.
+
+--------------------------------------------------------------------------------
+8. CAVEATS / LIMITATIONS  (state these to avoid misuse)
+--------------------------------------------------------------------------------
+- DOMAIN GAP: trained on CT segmentation masks (TotalSegmentator), not ultrasound.
+  It captures lobe SHAPE, not US appearance/intensity. Use it as a geometric prior,
+  not an image model.
+- SINGLE LOBE ONLY. Do not feed a whole-gland or two-lobe surface — the model has
+  512 points spanning one lobe and no isthmus. Reconstruct left and right
+  separately. (A source-data QC pass found rare cases where a segmentation tool
+  fused the whole gland into one lobe file; detect that by paired volumes — a true
+  single lobe has a non-empty contralateral lobe. 17 further subjects with bad
+  splits or implausible lobes were removed by visual QC before this build; the
+  list is thyroid_excluded_subjects.txt / thyroid_ssm_output_excl/excluded.txt.)
+- SIZE IS NORMALIZED OUT (scale=True). The model does not encode absolute lobe
+  size; the fitted pose's scale recovers it, but if absolute volume matters, take
+  it from the fitted mm surface (fit.points), not from the shape weights.
+- GOITER TAIL: very large lobes (>~20 cm3) are at the edge of the training
+  distribution; fits there converge less reliably and are less accurate. Raise
+  n_iter / n_restarts or accept a looser fit for those.
+- FACES ARE FOR VIEWING ONLY: m.faces is a convex hull (coarse, bridges
+  concavities). For a faithful mesh, triangulate fit.points yourself or use the
+  build repo's warp_surface (thin-plate-spline warp of a real groomed surface).
+- The model is HEALTHY+GOITER anatomy; nodules/cysts that locally deform the
+  capsule are not represented and will show up as fit residual (which can itself
+  be a useful abnormality signal).
+
+--------------------------------------------------------------------------------
+9. MINIMAL END-TO-END SKETCH  (right lobe, from a US surface cloud)
+--------------------------------------------------------------------------------
+import numpy as np
+from shape_modeling.analysis import load_model
+
+m = load_model("thyroid_ssm_output_excl/model.npz")
+
+cloud = load_us_lobe_surface_mm()          # (N, 3) mm points, right lobe
+cloud = cloud.copy(); cloud[:, 0] *= -1     # reflect x: right -> left chiral frame
+
+fit = m.fit_surface(cloud, n_modes=12, n_restarts=4, max_sd=3.0)
+
+recon = fit.points.copy(); recon[:, 0] *= -1   # reflect back to patient frame
+print("agreement:", fit.mean_distance, "mm  | hd95:", fit.hausdorff95, "mm")
+print("shape code (SD units):", np.round(fit.weights[:12], 2))
+print("converged:", fit.converged, "in", fit.n_iter, "iters")
+# recon = the completed, smoothed, plausible right-lobe surface (512 pts, mm)
+
+--------------------------------------------------------------------------------
+10. PROMPT-READY ONE-PARAGRAPH SUMMARY
+--------------------------------------------------------------------------------
+"I have a PCA statistical shape model of a single thyroid lobe, exported as a
+numpy .npz (mean 512x3, orthogonal modes, eigenvalues; units normalized/unitless
+because size was Procrustes-normalized out). It is side-agnostic: it lives in a
+left-chiral frame and right lobes must be mirrored across x before use. To
+reconstruct/optimize a 3D-ultrasound lobe I fit it to a non-corresponded (N,3) mm
+surface cloud with ExportedModel.fit_surface (ICP + shape-weight solve, 7-DOF
+similarity pose, weights clamped to +/-3 SD); it returns the fitted 512-point
+surface, a low-dim shape code, the recovered pose, and symmetric surface distance.
+Use ~10-15 modes (fewer = stronger prior for noisy/partial US). Held-out CT
+validation is ~1.0 mm median surface error at a 1.5 mm voxel floor; US will be
+looser. Fit left/right lobes separately; the model is shape-only (CT-trained, no
+isthmus, size normalized out)."
+
+--------------------------------------------------------------------------------
+11. PROVENANCE  (which build this file describes)
+--------------------------------------------------------------------------------
+This file describes the FINAL thyroid model, rebuilt 2026-08 with the 17 QC
+exclusions applied:
+    model      : thyroid_ssm_output_excl/model.npz
+    particles  : shapeworks_work_thyroid_final_512p_excl/
+    validation : thyroid_validation_knownside_output_excl/
+    build      : scripts/build_thyroid_ssm.py --num-particles 512 --iterations 1000
+                 --holdout-frac 0.2 --holdout-seed 0
+                 --exclude-file thyroid_excluded_subjects.txt
+    data       : Thyroid/Totalsegmentator_dataset_v201/<sID>/segmentations/
+                 thyroid_{left,right}.nii.gz (split by thyroid_modeling/split_thyroid.py)
+    manifests  : cohort.csv (1054 training lobes), heldout.txt (141 subjects),
+                 excluded.txt (17 subjects) — all in thyroid_ssm_output_excl/
+An earlier build (544 subjects / 1088 lobes, no exclusions, thyroid_ssm_output/)
+is superseded — ignore its numbers. Full data + parameter record: MODELLE.md in
+the build repo.
+================================================================================

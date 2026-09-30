@@ -239,6 +239,10 @@ __marimo__/
 /thyroid_ssm_output*/
 /thyroid_validation_*/
 
+# Hand-off bundles built by scripts/make_ssm_bundle.py — a copy of a model.npz plus a
+# GENERATED loader; both are regenerated, so versioning them would just duplicate the build.
+/*_export/
+
 # Held-out validation data (NCI-ISBI Prostate-3T, MSD Decathlon masks) — third-party data,
 # not redistributed; fetched separately like the other input datasets above.
 /testset/
@@ -273,3 +277,7 @@ __marimo__/
 notebooks
 CLAUDE.md
 ShapeModeling.code-workspace
+
+# grooming-reference medoid job (shape_modeling.analysis.reference) + SLURM logs
+/reference_*/
+/logs/
